@@ -1,5 +1,7 @@
 """Tests for system prompt loading and LLM generation config wiring."""
 
+import asyncio
+
 import pytest
 
 import services.answer_service as answer_service
@@ -102,3 +104,85 @@ async def test_generate_answer_passes_temperature_and_max_tokens_to_provider(
     assert captured["system_instruction"] == answer_service._SYSTEM_PROMPT
     assert captured["temperature"] == 0.7
     assert captured["max_output_tokens"] == 512
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_retries_transient_provider_errors(monkeypatch):
+    """Transient provider failures should be retried before returning a soft error."""
+    from unittest.mock import AsyncMock, patch
+
+    from services.providers.base import ProviderRateLimitError
+
+    calls = {"count": 0}
+
+    class _FlakyProvider:
+        async def generate(self, prompt, *, system_instruction, temperature, max_output_tokens):
+            calls["count"] += 1
+            if calls["count"] < 3:
+                raise ProviderRateLimitError("Rate exceeded")
+            return "recovered answer"
+
+    providers_mod._llm_provider = _FlakyProvider()
+    monkeypatch.setattr(answer_service, "_api_key_present", lambda: True)
+
+    try:
+        with patch("services.answer_service.retry_async", wraps=answer_service.retry_async) as mock_retry:
+            with patch("utils.retry.asyncio.sleep", new_callable=AsyncMock):
+                answer, latency_ms, model_name = await answer_service.generate_answer(
+                    "What?", "some context"
+                )
+    finally:
+        providers_mod._llm_provider = None
+
+    assert answer == "recovered answer"
+    assert latency_ms >= 0
+    assert model_name == ""
+    assert calls["count"] == 3
+    assert mock_retry.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_returns_soft_error_after_retry_exhaustion(monkeypatch):
+    """Exhausted provider retries should return the rate-limit soft error."""
+    from unittest.mock import AsyncMock, patch
+
+    from services.providers.base import ProviderRateLimitError
+
+    class _AlwaysRateLimitedProvider:
+        async def generate(self, prompt, *, system_instruction, temperature, max_output_tokens):
+            raise ProviderRateLimitError("Rate exceeded")
+
+    providers_mod._llm_provider = _AlwaysRateLimitedProvider()
+    monkeypatch.setattr(answer_service, "_api_key_present", lambda: True)
+
+    try:
+        with patch("utils.retry.asyncio.sleep", new_callable=AsyncMock):
+            answer, latency_ms, model_name = await answer_service.generate_answer(
+                "What?", "some context"
+            )
+    finally:
+        providers_mod._llm_provider = None
+
+    assert answer == answer_service.LLM_MSG_RATE_LIMIT
+    assert latency_ms == 0
+    assert model_name == ""
+
+
+@pytest.mark.asyncio
+async def test_generate_answer_wait_for_timeout_returns_soft_error(monkeypatch):
+    """Exhausted per-attempt timeouts should return the timeout soft error."""
+    from unittest.mock import patch
+
+    monkeypatch.setattr(answer_service, "_api_key_present", lambda: True)
+
+    async def _raise_timeout(*args, **kwargs):
+        raise asyncio.TimeoutError()
+
+    with patch("services.answer_service.retry_async", side_effect=_raise_timeout):
+        answer, latency_ms, model_name = await answer_service.generate_answer(
+            "What?", "some context"
+        )
+
+    assert answer == answer_service.LLM_MSG_TIMEOUT
+    assert latency_ms == 0
+    assert model_name == ""

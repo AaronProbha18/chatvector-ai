@@ -1,5 +1,6 @@
 """LLM answer generation for RAG chat — delegates to the configured provider."""
 
+import asyncio
 import logging
 import time
 from pathlib import Path
@@ -12,6 +13,12 @@ from services.providers.base import (
     ProviderConnectionError,
     ProviderRateLimitError,
     ProviderTimeoutError,
+)
+from utils.retry import (
+    DEFAULT_BACKOFF,
+    DEFAULT_BASE_DELAY,
+    DEFAULT_MAX_RETRIES,
+    retry_async,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,11 +114,22 @@ async def generate_answer(question: str, context: str) -> tuple[str, int, str]:
     try:
         provider = get_llm_provider()
         t0 = time.perf_counter()
-        answer = await provider.generate(
-            contents,
-            system_instruction=_get_system_prompt(),
-            temperature=config.LLM_TEMPERATURE,
-            max_output_tokens=config.LLM_MAX_OUTPUT_TOKENS,
+
+        async def _generate() -> str:
+            return await provider.generate(
+                contents,
+                system_instruction=_get_system_prompt(),
+                temperature=config.LLM_TEMPERATURE,
+                max_output_tokens=config.LLM_MAX_OUTPUT_TOKENS,
+            )
+
+        answer = await retry_async(
+            _generate,
+            max_retries=DEFAULT_MAX_RETRIES,
+            base_delay=DEFAULT_BASE_DELAY,
+            backoff=DEFAULT_BACKOFF,
+            timeout=config.LLM_HTTP_TIMEOUT_MS / 1000.0,
+            func_name="answer_service.generate_answer",
         )
         latency_ms = int((time.perf_counter() - t0) * 1000)
         logger.info("Answer generated successfully")
@@ -150,6 +168,15 @@ async def generate_answer(question: str, context: str) -> tuple[str, int, str]:
             "LLM connection error (%s): %s",
             type(e).__name__,
             e,
+            exc_info=True,
+            extra={"error_type": type(e).__name__},
+        )
+        return _msg_timeout_or_connection(), 0, ""
+
+    except asyncio.TimeoutError as e:
+        logger.error(
+            "LLM request timed out after retries (%s)",
+            type(e).__name__,
             exc_info=True,
             extra={"error_type": type(e).__name__},
         )
