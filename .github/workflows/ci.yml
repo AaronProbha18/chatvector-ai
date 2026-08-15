@@ -239,3 +239,42 @@ jobs:
 
       - name: Test package exports
         run: npm run test:exports
+ 
+  prod-compose-e2e:
+    name: Production Compose E2E Smoke Test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run production Compose E2E smoke test
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: postgres
+          DATABASE_URL: postgresql+asyncpg://postgres:postgres@db:5432/postgres
+          REDIS_URL: redis://redis:6379/0
+          APP_ENV: production
+          LLM_PROVIDER: ${{ vars.CI_LLM_PROVIDER }}
+          LLM_MODEL: ${{ vars.CI_LLM_MODEL }}
+          EMBEDDING_PROVIDER: ${{ vars.CI_EMBEDDING_PROVIDER }}
+          EMBEDDING_MODEL: ${{ vars.CI_EMBEDDING_MODEL }}
+          GEN_AI_KEY: ${{ secrets.GEN_AI_KEY }}
+          QUEUE_BACKEND: redis
+          QUEUE_WORKER_COUNT: 3
+          LOG_LEVEL: INFO
+        run: |
+          chmod +x scripts/prod-e2e-smoke.sh
+          ./scripts/prod-e2e-smoke.sh
+
+      - name: Show production stack logs on failure
+        if: failure()
+        run: |
+          docker compose -f docker-compose.prod.yml ps
+          docker compose -f docker-compose.prod.yml logs --no-color
+
+      - name: Clean up production stack
+        if: always()
+        run: |
+          docker compose -f docker-compose.prod.yml down -v --remove-orphans
