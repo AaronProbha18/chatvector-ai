@@ -35,7 +35,7 @@ export function BatchResultCard({
         {isError ? (
           <AlertCircle size={16} className="shrink-0 text-red-500" />
         ) : (
-          <CheckCircle2 size={16} className="shrink-0 text-green-500" />
+          <CheckCircle2 size={16} className="shrink-0 text-accent-text" />
         )}
         <span className="truncate text-sm font-medium" title={title}>
           {title}
@@ -69,8 +69,6 @@ export function BatchResultCard({
         zeroChunksMessage="No chunks retrieved for this query."
         showZeroChunks={showBody && !isError}
         textClassName="whitespace-pre-wrap break-words text-sm leading-relaxed text-foreground"
-        sourceClassName="text-xs text-muted"
-        sourcesContainerClassName="mt-auto flex flex-col gap-1 border-t border-border pt-2"
         metadataClassName="text-xs text-muted"
         zeroChunksClassName="text-sm text-muted italic"
       />
