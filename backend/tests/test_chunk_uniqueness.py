@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+from uuid import uuid4
 
 import pytest
 
@@ -16,6 +17,7 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from core.models import DocumentChunk
 from core.config import get_embedding_dim
 from db.base import ChunkRecord
+from services.api_key_service import ensure_tenant_exists
 
 DB_URL = os.getenv(
     "DATABASE_URL",
@@ -55,7 +57,8 @@ async def test_duplicate_chunk_index_rejected(require_unique_index):
     from db.sqlalchemy_service import SQLAlchemyService
 
     svc = SQLAlchemyService()
-    tenant_id = "dev"
+    tenant_id = f"chunk-uniq-{uuid4().hex[:8]}"
+    await ensure_tenant_exists(tenant_id, "Chunk uniqueness test")
     doc_id = await svc.create_document("dup-test.pdf", tenant_id=tenant_id)
 
     dim = get_embedding_dim()
