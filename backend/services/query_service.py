@@ -1,6 +1,7 @@
 """Query transformation for retrieval (rewrite, expand, step-back)."""
 
 import logging
+import re
 from dataclasses import dataclass
 
 from core.config import config
@@ -64,12 +65,44 @@ async def rewrite_query(question: str) -> str:
     system_instruction = (
         "You are a query rewriting assistant. Rephrase the following question to be "
         "more specific and retrieval-friendly for semantic search over documents. "
-        "Return only the rewritten query, nothing else."
+        "Return only the rewritten query as plain text. Do not include any prefix, "
+        "explanation, numbering, or quotation marks."
     )
     rewritten = await _llm_transform(system_instruction, question)
     if rewritten is None:
         return question
     return rewritten
+
+
+_LIST_MARKER_PATTERN = re.compile(r"^[\d]+[.)]\s*|^[-*]\s+")
+
+
+def _strip_list_marker(line: str) -> str:
+    """Remove common leading list markers such as 1., 1), -, or *."""
+    return _LIST_MARKER_PATTERN.sub("", line.strip()).strip()
+
+
+def _collect_unique_alternatives(question: str, lines: list[str]) -> list[str]:
+    """Return up to two unique alternatives, excluding the original query."""
+    normalized_original = question.casefold()
+    seen: set[str] = {normalized_original}
+    alternatives: list[str] = []
+
+    for line in lines:
+        cleaned = _strip_list_marker(line)
+        if not cleaned:
+            continue
+
+        normalized = cleaned.casefold()
+        if normalized in seen:
+            continue
+
+        seen.add(normalized)
+        alternatives.append(cleaned)
+        if len(alternatives) == 2:
+            break
+
+    return alternatives
 
 
 async def expand_query(question: str) -> list[str]:
@@ -81,8 +114,9 @@ async def expand_query(question: str) -> list[str]:
     raw = await _llm_transform(system_instruction, question)
     if raw is None:
         return [question]
-    lines = [line.strip() for line in raw.splitlines() if line.strip()]
-    alternatives = lines[:2]
+
+    lines = [line for line in raw.splitlines() if line.strip()]
+    alternatives = _collect_unique_alternatives(question, lines)
     if not alternatives:
         return [question]
     return [question, *alternatives]
@@ -96,6 +130,9 @@ async def stepback_query(question: str) -> list[str]:
     )
     broader = await _llm_transform(system_instruction, question)
     if broader is None:
+        return [question]
+    broader = broader.strip()
+    if not broader or broader.casefold() == question.strip().casefold():
         return [question]
     return [question, broader]
 

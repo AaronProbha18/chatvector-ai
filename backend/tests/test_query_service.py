@@ -102,6 +102,47 @@ async def test_expand_degrades_on_llm_failure(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_expand_strips_numbered_and_bulleted_alternatives(monkeypatch):
+    monkeypatch.setattr(
+        query_service_mod,
+        "_llm_transform",
+        AsyncMock(
+            return_value="1. First alternative\n2) Second alternative\n- Third alt"
+        ),
+    )
+
+    result = await expand_query("What is the capital of France?")
+
+    assert result == [
+        "What is the capital of France?",
+        "First alternative",
+        "Second alternative",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_expand_deduplicates_alternatives_case_insensitively(monkeypatch):
+    monkeypatch.setattr(
+        query_service_mod,
+        "_llm_transform",
+        AsyncMock(
+            return_value=(
+                "What is the capital of France?\n"
+                "Capital city of France?\n"
+                "capital city of france?"
+            )
+        ),
+    )
+
+    result = await expand_query("What is the capital of France?")
+
+    assert result == [
+        "What is the capital of France?",
+        "Capital city of France?",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stepback_degrades_on_llm_failure(monkeypatch):
     monkeypatch.setattr(
         query_service_mod,
@@ -112,6 +153,19 @@ async def test_stepback_degrades_on_llm_failure(monkeypatch):
     result = await stepback_query("solo")
 
     assert result == ["solo"]
+
+
+@pytest.mark.asyncio
+async def test_stepback_returns_original_when_broader_query_is_duplicate(monkeypatch):
+    monkeypatch.setattr(
+        query_service_mod,
+        "_llm_transform",
+        AsyncMock(return_value="  What is the capital of France?  "),
+    )
+
+    result = await stepback_query("What is the capital of France?")
+
+    assert result == ["What is the capital of France?"]
 
 
 def test_unknown_strategy_logs_warning_and_returns_original(caplog, monkeypatch):
