@@ -167,8 +167,9 @@ An async in-memory `asyncio.Queue` decouples upload from processing.
 
 **Key properties:**
 - Bounded queue (`QUEUE_MAX_SIZE`, default 100) — uploads beyond capacity return 503
+- Redis backend capacity is an approximate bound under highly concurrent enqueues; the in-memory queue enforces capacity atomically within the process
 - Worker pool (`QUEUE_WORKER_COUNT`, default 3, max 5)
-- Token bucket rate limiter (`QUEUE_EMBEDDING_RPS`, default 2.0/sec) — caps Gemini embedding API calls across all workers
+- Token bucket rate limiter (`QUEUE_EMBEDDING_RPS`, default 2.0/sec) — caps embedding HTTP batches per API process across all queue workers
 - Exponential backoff with jitter between job retries
 - 4xx `UploadPipelineError` failures (e.g. no text extracted) go directly to DLQ without consuming retries
 - Transient failures retry up to `QUEUE_JOB_MAX_RETRIES` times, then move to DLQ
@@ -181,11 +182,20 @@ An async in-memory `asyncio.Queue` decouples upload from processing.
 
 **On server restart:**
 Documents left in any in-progress state are bulk-updated to `failed`
-before workers start accepting new jobs.
+before workers start accepting new jobs. This reconciliation is safe under
+the supported single-process API topology only.
 
 > **Note:** The default queue is in-memory for local development. In production
 > (`APP_ENV=production`), the Redis-backed queue is the default for job durability
-> and multi-instance support. Set `QUEUE_BACKEND=memory` explicitly to override.
+> across API restarts. Set `QUEUE_BACKEND=memory` explicitly to override.
+>
+> **Production topology:** Phase 3 supports **one API process/container**
+> (`uvicorn --workers 1`). Redis/RQ worker threads provide ingestion concurrency
+> within that process. Running multiple API processes or containers is not
+> currently supported. Redis does not by itself make API instances horizontally
+> scalable. Concurrency settings such as `QUEUE_WORKER_COUNT`,
+> `RETRIEVAL_MAX_CONCURRENCY`, DB pool sizes, and `QUEUE_EMBEDDING_RPS` are
+> process-scoped.
 
 ---
 
@@ -358,7 +368,7 @@ The raw key is printed once and never stored. Set it in all API clients as the B
 
 **Auth non-goals:** ChatVector does not provide user login/signup, OAuth, RBAC, billing, or an API-key management UI. Keys are managed via CLI (`create-tenant-key`, `list-tenant-keys`, `revoke-tenant-key`, `rotate-tenant-key`, `set-tenant-key-expiry`, `set-tenant-key-external-user-id`) or direct DB updates.
 
-**Session persistence:** All session state is now fully durable. Chat message turns are stored in `chat_messages`. Session metadata (`id`, `tenant_id`, `created_at`, `last_active`) is stored in the `sessions` table and document bindings are stored in `session_documents` — both introduced by migration `007_sessions.sql`. `backend/services/session_service.py` reads and writes exclusively through `SQLAlchemyService`; the previous in-memory `_SESSIONS` dict has been removed. Sessions survive backend restarts and are shared across all Uvicorn workers (`docker-compose.prod.yml` runs `--workers 2`).
+**Session persistence:** All session state is now fully durable. Chat message turns are stored in `chat_messages`. Session metadata (`id`, `tenant_id`, `created_at`, `last_active`) is stored in the `sessions` table and document bindings are stored in `session_documents` — both introduced by migration `007_sessions.sql`. `backend/services/session_service.py` reads and writes exclusively through `SQLAlchemyService`; the previous in-memory `_SESSIONS` dict has been removed. Sessions survive backend restarts. The production Compose stack runs a single Uvicorn worker process per API container (`--workers 1`).
 
 ---
 

@@ -70,8 +70,27 @@ def _bar_percent(percent: int) -> str:
     return "[" + "█" * n + "░" * (_BAR_WIDTH - n) + "]"
 
 
-def _workers_active_count() -> int:
-    return ingestion_queue.active_worker_count()
+def _workers_active_count() -> int | None:
+    try:
+        return ingestion_queue.active_worker_count()
+    except Exception:
+        logger.warning("Worker count unavailable", exc_info=True)
+        return None
+
+
+def _sync_queue_metrics() -> tuple[int, int]:
+    return ingestion_queue.queue_size(), ingestion_queue.active_worker_count()
+
+
+async def _queue_metrics() -> tuple[int | None, int | None]:
+    """Return queue depth and active worker count, or (None, None) on failure."""
+    try:
+        if config.QUEUE_BACKEND == "redis":
+            return await asyncio.to_thread(_sync_queue_metrics)
+        return ingestion_queue.queue_size(), ingestion_queue.active_worker_count()
+    except Exception:
+        logger.warning("Queue metrics unavailable", exc_info=True)
+        return None, None
 
 
 async def _database_connected_and_document_count() -> tuple[bool, int | None]:
@@ -303,8 +322,8 @@ def _build_payload(
     memory_pct: int,
     uptime_str: str,
     version: str,
-    queue_pending: int,
-    workers_active: int,
+    queue_pending: int | None,
+    workers_active: int | None,
     embedding_health: dict,
     llm_health: dict,
     redis_health: dict | None,
@@ -387,10 +406,18 @@ def _format_ascii(data: dict) -> str:
     docs_str = f"{docs:,}" if docs is not None else "—"
     q_cur = m["document_queue"]
     q_max = config.QUEUE_MAX_SIZE
-    queue_bar = _bar(q_cur, q_max)
+    if q_cur is None:
+        queue_line = "📊 Queue: — unavailable"
+    else:
+        queue_bar = _bar(q_cur, q_max)
+        queue_line = f"📊 Queue: {queue_bar} {q_cur}/{q_max} pending"
     mem_bar = _bar_percent(mem)
     w_active = m["workers_active"]
     w_cap = config.QUEUE_WORKER_COUNT
+    if w_active is None:
+        workers_line = f"⚙️ Workers Active (this process): —/{w_cap}"
+    else:
+        workers_line = f"⚙️ Workers Active (this process): {w_active}/{w_cap}"
 
     lines = [
         "╔════════════════════════════════════════════════════╗",
@@ -402,8 +429,8 @@ def _format_ascii(data: dict) -> str:
         row(emb_line),
         row(llm_line),
         row(""),
-        row(f"📊 Queue: {queue_bar} {q_cur}/{q_max} pending"),
-        row(f"⚙️ Workers Active: {w_active}/{w_cap}"),
+        row(queue_line),
+        row(workers_line),
         row(f"💾 Memory Usage:   {mem_bar} {mem}%"),
         row(f"📁 Documents Indexed: {docs_str}"),
         row("💬 Total Queries:   — (not tracked)"),
@@ -475,8 +502,7 @@ async def status(request: Request, auth: AuthContext = Depends(require_auth)):  
     memory_pct = _process_memory_percent()
     version = _read_version()
     uptime_str = _format_uptime(start)
-    q_pending = ingestion_queue.queue_size()
-    workers_active = _workers_active_count()
+    q_pending, workers_active = await _queue_metrics()
 
     payload = _build_payload(
         db_ok=db_ok,

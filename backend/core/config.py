@@ -183,6 +183,8 @@ class Settings:
     QUEUE_WORKER_COUNT: int = max(1, min(5, int(os.getenv("QUEUE_WORKER_COUNT", "3"))))
     QUEUE_MAX_SIZE: int = max(1, int(os.getenv("QUEUE_MAX_SIZE", "100")))
     QUEUE_EMBEDDING_RPS: float = max(0.1, float(os.getenv("QUEUE_EMBEDDING_RPS", "2.0")))
+    QUEUE_SPILL_DIR: str = os.getenv("QUEUE_SPILL_DIR", "/tmp/chatvector")
+    QUEUE_DLQ_MAX_ENTRIES: int = max(1, int(os.getenv("QUEUE_DLQ_MAX_ENTRIES", "1000")))
     QUEUE_JOB_MAX_RETRIES: int = max(0, int(os.getenv("QUEUE_JOB_MAX_RETRIES", "3")))
     QUEUE_RETRY_BASE_DELAY: float = max(
         0.1, float(os.getenv("QUEUE_RETRY_BASE_DELAY", "2.0"))

@@ -1,4 +1,5 @@
 from abc import ABC, abstractmethod
+import asyncio
 import bisect
 import logging
 import pathlib
@@ -813,6 +814,7 @@ class IngestionPipeline:
         doc_id: str,
         tenant_id: str,
         langchain_docs: list[LangChainDocument],
+        rate_limiter=None,
     ) -> list[list[float]]:
         total = len(langchain_docs)
         texts = [doc.page_content for doc in langchain_docs]
@@ -827,6 +829,8 @@ class IngestionPipeline:
 
         for start in range(0, total, _EMBEDDING_PROGRESS_BATCH_SIZE):
             batch_texts = texts[start : start + _EMBEDDING_PROGRESS_BATCH_SIZE]
+            if rate_limiter is not None:
+                await rate_limiter.acquire()
             batch_embeddings = await get_embeddings(batch_texts)
             embeddings.extend(batch_embeddings)
             processed = start + len(batch_texts)
@@ -919,7 +923,8 @@ class IngestionPipeline:
 
             stage = "chunking"
             await self._update_status(doc_id=doc_id, status="chunking", tenant_id=tenant_id)
-            langchain_docs = self._chunk_document_text(
+            langchain_docs = await asyncio.to_thread(
+                self._chunk_document_text,
                 file_text,
                 file_name=safe_filename,
                 content_type=file.content_type,
@@ -934,10 +939,13 @@ class IngestionPipeline:
                 )
 
             stage = "embedding"
+            from services.queue_base import get_process_embedding_rate_limiter
+
             embeddings = await self._embed_documents_with_progress(
                 doc_id=doc_id,
                 tenant_id=tenant_id,
                 langchain_docs=langchain_docs,
+                rate_limiter=get_process_embedding_rate_limiter(),
             )
 
             if len(embeddings) != len(langchain_docs):
@@ -1036,7 +1044,8 @@ class IngestionPipeline:
 
             stage = "chunking"
             await self._update_status(doc_id=doc_id, status="chunking", tenant_id=tenant_id)
-            langchain_docs = self._chunk_document_text(
+            langchain_docs = await asyncio.to_thread(
+                self._chunk_document_text,
                 file_text,
                 file_name=safe_filename,
                 content_type=content_type,
@@ -1052,12 +1061,11 @@ class IngestionPipeline:
                 )
 
             stage = "embedding"
-            if rate_limiter is not None:
-                await rate_limiter.acquire()
             embeddings = await self._embed_documents_with_progress(
                 doc_id=doc_id,
                 tenant_id=tenant_id,
                 langchain_docs=langchain_docs,
+                rate_limiter=rate_limiter,
             )
 
             if len(embeddings) != len(langchain_docs):

@@ -34,10 +34,12 @@ marked complete, so step 3 triggers the DB scan that returns all 6 docs.
 Durable truth
 ─────────────
 The database (documents.tenant_id column) is authoritative.  The in-memory
-registry is a performance optimisation for a single-process deployment only.
-Multi-process deployments (e.g. multi-worker uvicorn) must query the DB on
-every tenant-scope retrieval; set TENANT_REGISTRY_DISABLED=true to disable
-the cache and always query the DB.
+registry is a performance optimisation for the supported single-process API
+topology only.  Phase 3 does not support multiple API processes or containers;
+the cache is process-local and must not be shared across API instances.
+
+Set TENANT_REGISTRY_DISABLED=true to bypass the cache and always query the DB
+(for debugging or if you intentionally run an unsupported multi-process layout).
 """
 
 from __future__ import annotations
@@ -48,8 +50,7 @@ from collections import defaultdict
 
 logger = logging.getLogger(__name__)
 
-# Set TENANT_REGISTRY_DISABLED=true to bypass the cache entirely (recommended
-# for multi-worker deployments where the registry cannot be shared).
+# Set TENANT_REGISTRY_DISABLED=true to bypass the cache entirely (always query DB).
 _REGISTRY_DISABLED: bool = os.getenv("TENANT_REGISTRY_DISABLED", "false").lower() in (
     "1", "true", "yes"
 )

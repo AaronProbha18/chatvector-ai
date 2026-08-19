@@ -56,6 +56,13 @@ class AsyncioIngestionQueue(BaseIngestionQueue):
         )
         self._running = False
 
+    def _append_dlq(self, entry: DLQEntry) -> None:
+        """Append a DLQ entry and trim to ``QUEUE_DLQ_MAX_ENTRIES``."""
+        self._dlq.append(entry)
+        overflow = len(self._dlq) - config.QUEUE_DLQ_MAX_ENTRIES
+        if overflow > 0:
+            del self._dlq[:overflow]
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -231,7 +238,7 @@ class AsyncioIngestionQueue(BaseIngestionQueue):
                     f"— moving to DLQ: {exc}",
                     exc_info=True,
                 )
-                self._dlq.append(DLQEntry(
+                self._append_dlq(DLQEntry(
                     doc_id=job.doc_id,
                     file_name=job.file_name,
                     content_type=job.content_type,
@@ -247,7 +254,7 @@ class AsyncioIngestionQueue(BaseIngestionQueue):
                     f"non-retryable error — moving to DLQ: {exc}",
                     exc_info=True,
                 )
-                self._dlq.append(DLQEntry(
+                self._append_dlq(DLQEntry(
                     doc_id=job.doc_id,
                     file_name=job.file_name,
                     content_type=job.content_type,
@@ -301,7 +308,7 @@ class AsyncioIngestionQueue(BaseIngestionQueue):
                         logger.error(
                             f"Failed to set failed status for {job.doc_id}: {status_err}"
                         )
-                    self._dlq.append(DLQEntry(
+                    self._append_dlq(DLQEntry(
                         doc_id=job.doc_id,
                         file_name=job.file_name,
                         content_type=job.content_type,
@@ -318,7 +325,7 @@ class AsyncioIngestionQueue(BaseIngestionQueue):
                     f"(final attempt={job.attempt}) — moving to DLQ: {exc}",
                     exc_info=True,
                 )
-                self._dlq.append(DLQEntry(
+                self._append_dlq(DLQEntry(
                     doc_id=job.doc_id,
                     file_name=job.file_name,
                     content_type=job.content_type,

@@ -552,7 +552,9 @@ same field — they are not interchangeable across fields or with `score`.
 ```env
 QUEUE_WORKER_COUNT=3      # concurrent background workers (1–5)
 QUEUE_MAX_SIZE=100        # max pending jobs; uploads beyond this return 503
-QUEUE_EMBEDDING_RPS=2.0   # max embedding API calls/sec across workers
+QUEUE_EMBEDDING_RPS=2.0   # max embedding HTTP batches/sec per API process (burst = same value)
+QUEUE_SPILL_DIR=/tmp/chatvector  # local spill dir for Redis queue file bytes (one API container)
+QUEUE_DLQ_MAX_ENTRIES=1000  # max dead-letter records retained
 QUEUE_JOB_MAX_RETRIES=3   # retries before a job moves to DLQ
 QUEUE_RETRY_BASE_DELAY=2.0 # base seconds for retry backoff
 ```
@@ -688,7 +690,7 @@ mounts live backend code and uses development defaults.
 
 `docker-compose.prod.yml` is a **standalone** file — it does not
 extend or merge with `docker-compose.yml`. It disables code bind
-mounts, runs multi-worker uvicorn, enables JSON logging, and applies
+mounts, runs single-process uvicorn (`--workers 1`), enables JSON logging, and applies
 resource limits.
 
 ```bash
@@ -882,14 +884,15 @@ environment:
 ```
 
 The production API runs with a single Uvicorn worker process in the Compose
-container:
+container (Phase 3 supported topology):
 
 ```yaml
-command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 ```
 
-This keeps the API container's in-process background worker configuration
-predictable while the E2E test exercises the Redis-backed ingestion queue.
+RQ worker threads (`QUEUE_WORKER_COUNT`) provide ingestion concurrency within
+that one API process. Running multiple Uvicorn workers or API containers is not
+supported in Phase 3.
 
 The API container has a 1 GB memory limit:
 

@@ -47,7 +47,13 @@ Additional production-oriented defaults in `docker-compose.prod.yml`:
 
 - `QUEUE_WORKER_COUNT` (default `3`)
 - `LOG_FORMAT=JSON`
-- Multi-worker Uvicorn (`--workers 2`)
+- Single-process Uvicorn (`--workers 1`)
+
+**Supported topology:** Phase 3 runs one API process per container. Redis/RQ worker
+threads provide ingestion concurrency within that process. Multiple API processes
+or containers are not supported. Concurrency env vars (`QUEUE_WORKER_COUNT`,
+`QUEUE_EMBEDDING_RPS`, `RETRIEVAL_MAX_CONCURRENCY`, DB pool sizes) are
+process-scoped.
 
 **Never deploy with `APP_ENV=development` or `APP_ENV=test` in a shared or public
 environment.** Those modes bypass API-key authentication entirely.
@@ -129,8 +135,8 @@ Revoking a key is idempotent.
 ## 5. Start the production Docker Compose stack
 
 `docker-compose.prod.yml` is **standalone** — it does not extend
-`docker-compose.yml`. It disables dev bind mounts, runs multi-worker Uvicorn, uses
-JSON logging, and applies resource limits.
+`docker-compose.yml`. It disables dev bind mounts, runs single-process Uvicorn,
+uses JSON logging, and applies resource limits.
 
 ```bash
 # Option A — Makefile helper (reads env from your shell / project .env)
@@ -172,7 +178,8 @@ Validate the full authenticated upload → ingest → chat path locally:
 | **Missing migrations / ledger drift** | Schema errors at runtime | Inspect `schema_migrations`; apply missing SQL files |
 | **Re-running `001_init.sql` on existing data** | Data loss | Apply only missing numbered migrations |
 | **No API key bootstrap** | No tenant can authenticate | Run `create-tenant-key` once per environment |
-| **Redis unreachable** | Upload/queue failures | Verify `REDIS_URL` and Redis health |
+| **Redis unreachable** | Upload/queue failures; `/status` may show queue metrics unavailable | Verify `REDIS_URL` and Redis health |
+| **Multiple API workers/containers** | Unsupported in Phase 3; stale-doc reconciliation and tenant registry break | Run `--workers 1` and one API container |
 | **pgvector not enabled** | Embedding storage fails | Enable extension on Postgres host |
 | **Expecting `/docs` in prod** | Swagger appears disabled | Use OpenAPI from a dev instance or export schema separately |
 | **Embedding provider switch without re-index** | Dimension mismatch errors | Fresh DB or re-embed after changing embedding models |
