@@ -39,9 +39,9 @@ pytestmark = [
 from services.queue_base import DLQEntry, QueueFull, QueueJob
 from services.queue_redis import (
     DLQ_REDIS_KEY,
-    TEMP_DIR,
     RedisIngestionQueue,
     _push_dlq_entry,
+    spill_dir,
 )
 
 
@@ -72,13 +72,15 @@ def _clean_redis():
 
 
 @pytest.fixture(autouse=True)
-def _clean_temp_dir():
-    """Ensure the temp directory is clean."""
-    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+def _clean_spill_dir(monkeypatch, tmp_path):
+    """Ensure the spill directory is clean."""
+    spill = tmp_path / "spill"
+    monkeypatch.setattr("services.queue_redis.config.QUEUE_SPILL_DIR", str(spill))
     yield
-    for f in TEMP_DIR.iterdir():
-        if f.is_file():
-            f.unlink(missing_ok=True)
+    if spill.exists():
+        for f in spill.iterdir():
+            if f.is_file():
+                f.unlink(missing_ok=True)
 
 
 def _make_job(doc_id: str = "doc-redis-test") -> QueueJob:
@@ -116,7 +118,7 @@ async def test_enqueue_writes_temp_file(monkeypatch):
 
     await queue.enqueue(_make_job("doc-tmp"))
 
-    temp_path = TEMP_DIR / "doc-tmp"
+    temp_path = spill_dir() / "doc-tmp"
     assert temp_path.exists()
     assert temp_path.read_bytes() == b"fake-pdf-bytes"
 
@@ -248,7 +250,7 @@ async def test_temp_file_cleaned_after_successful_processing(monkeypatch):
     queue = RedisIngestionQueue()
     await queue.enqueue(_make_job("doc-cleanup"))
 
-    temp_path = TEMP_DIR / "doc-cleanup"
+    temp_path = spill_dir() / "doc-cleanup"
     assert temp_path.exists()
 
     mock_pipeline_cls = MagicMock()
@@ -263,3 +265,98 @@ async def test_temp_file_cleaned_after_successful_processing(monkeypatch):
         )
 
     assert not temp_path.exists()
+
+
+# ---------------------------------------------------------------------------
+# Spill dir, payload errors, DLQ cap, worker names, start idempotency
+# ---------------------------------------------------------------------------
+
+@pytest.mark.asyncio
+async def test_enqueue_uses_custom_spill_dir(monkeypatch, tmp_path):
+    custom = tmp_path / "custom-spill"
+    monkeypatch.setattr("services.queue_redis.config.QUEUE_SPILL_DIR", str(custom))
+    monkeypatch.setattr("services.queue_redis.config.QUEUE_MAX_SIZE", 100)
+    monkeypatch.setattr("services.queue_redis.config.REDIS_URL", _REDIS_TEST_URL)
+    queue = RedisIngestionQueue()
+
+    await queue.enqueue(_make_job("doc-custom-spill"))
+
+    assert (custom / "doc-custom-spill").exists()
+
+
+@pytest.mark.asyncio
+async def test_missing_payload_error_is_user_safe(monkeypatch):
+    monkeypatch.setattr("services.queue_redis.config.REDIS_URL", _REDIS_TEST_URL)
+    update_status = AsyncMock()
+
+    with patch("db.update_document_status", update_status):
+        from services.queue_redis import _async_execute_job
+        await _async_execute_job(
+            "doc-missing",
+            "test.pdf",
+            "application/pdf",
+            "/nonexistent/path/doc-missing",
+            0,
+            tenant_id="tenant-1",
+        )
+
+    update_status.assert_awaited_once()
+    error = update_status.await_args.kwargs["error"]
+    assert error["code"] == "job_payload_missing"
+    assert error["stage"] == "queued"
+    assert "re-upload" in error["message"].lower()
+    assert "/nonexistent" not in error["message"]
+
+
+def test_dlq_trim_keeps_newest_entries(monkeypatch):
+    monkeypatch.setattr("services.queue_redis.config.REDIS_URL", _REDIS_TEST_URL)
+    monkeypatch.setattr("services.queue_redis.config.QUEUE_DLQ_MAX_ENTRIES", 3)
+
+    for i in range(5):
+        _push_dlq_entry(DLQEntry(
+            doc_id=f"doc-{i}",
+            file_name="f.pdf",
+            content_type="application/pdf",
+            attempt=i,
+            error=f"err-{i}",
+        ))
+
+    conn = redis_lib.Redis.from_url(_REDIS_TEST_URL)
+    raw = conn.lrange(DLQ_REDIS_KEY, 0, -1)
+    assert len(raw) == 3
+    ids = [json.loads(r)["doc_id"] for r in raw]
+    assert ids == ["doc-2", "doc-3", "doc-4"]
+
+
+def test_rq_worker_names_unique_under_same_pid(monkeypatch):
+    from services.queue_redis import _rq_worker_name
+
+    monkeypatch.setattr("services.queue_redis.os.getpid", lambda: 99999)
+    names = {_rq_worker_name(i) for i in range(10)}
+    assert len(names) == 10
+    assert all("99999" in name for name in names)
+
+
+@pytest.mark.asyncio
+async def test_redis_start_is_idempotent(monkeypatch):
+    monkeypatch.setattr("services.queue_redis.config.QUEUE_WORKER_COUNT", 1)
+    monkeypatch.setattr("services.queue_redis.config.REDIS_URL", _REDIS_TEST_URL)
+    queue = RedisIngestionQueue()
+
+    with patch.object(queue, "_run_worker"):
+        await queue.start()
+        first_threads = queue._worker_threads
+        await queue.start()
+        assert queue._worker_threads is first_threads
+        assert len(queue._worker_threads) == 1
+        await queue.stop()
+
+
+@pytest.mark.asyncio
+async def test_enqueue_position_never_zero(monkeypatch):
+    monkeypatch.setattr("services.queue_redis.config.QUEUE_MAX_SIZE", 100)
+    monkeypatch.setattr("services.queue_redis.config.REDIS_URL", _REDIS_TEST_URL)
+    queue = RedisIngestionQueue()
+
+    position = await queue.enqueue(_make_job("doc-pos-never-zero"))
+    assert position >= 1

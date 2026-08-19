@@ -358,6 +358,8 @@ class SQLAlchemyService(DatabaseService):
             document.status = status
             if error is not None:
                 document.error = error
+            elif status != "failed":
+                document.error = None
             if chunks is not None:
                 document.chunks = chunks
             document.updated_at = datetime.utcnow()

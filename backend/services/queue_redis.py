@@ -3,8 +3,8 @@ Redis-Backed Durable Ingestion Queue
 ======================================
 
 Uses RQ (Redis Queue) as a persistent job store so that queued uploads survive
-server restarts.  File bytes are spilled to a temp file under /tmp/chatvector/
-rather than stored in Redis to keep message sizes small.
+server restarts.  File bytes are spilled to ``QUEUE_SPILL_DIR`` rather than
+stored in Redis to keep message sizes small.
 
 Worker threads
 --------------
@@ -13,9 +13,13 @@ thread so the FastAPI event loop is not blocked.
 
 Rate limiting
 -------------
-TokenBucketRateLimiter is instantiated per-worker inside asyncio.run(), so the
-bucket is NOT shared across workers or processes.  For global rate limiting,
-move the bucket to Redis (e.g. redis-cell) — noted as future work.
+One process-scoped ``TokenBucketRateLimiter`` (see ``get_process_embedding_rate_limiter``)
+limits embedding HTTP batches across all RQ worker threads in this API process.
+
+Topology
+--------
+Phase 3 supports one API process/container.  Running multiple API processes or
+containers is not a supported topology; see DEPLOYMENT.md.
 """
 
 import asyncio
@@ -23,8 +27,10 @@ import json
 import logging
 import os
 import random
+import socket
 import threading
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -34,20 +40,47 @@ from rq import Queue as RQQueue
 from rq import SimpleWorker
 from rq.job import Job as RQJob
 
-from core.config import config
+from core.config import config, redis_connection_kwargs
 from services.queue_base import (
     BaseIngestionQueue,
     DLQEntry,
     QueueFull,
     QueueJob,
-    TokenBucketRateLimiter,
+    get_process_embedding_rate_limiter,
+    is_retryable_ingestion_failure,
 )
 
 logger = logging.getLogger(__name__)
 
-TEMP_DIR = Path("/tmp/chatvector")
 DLQ_REDIS_KEY = "chatvector:dlq"
 RQ_QUEUE_NAME = "chatvector-ingestion"
+
+JOB_PAYLOAD_MISSING_USER_MESSAGE = (
+    "Upload payload was lost before processing could start. "
+    "Please re-upload the document."
+)
+
+
+def spill_dir() -> Path:
+    """Return the configured spill directory, creating it if needed."""
+    path = Path(config.QUEUE_SPILL_DIR)
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _job_payload_missing_error() -> dict:
+    return {
+        "code": "job_payload_missing",
+        "stage": "queued",
+        "message": JOB_PAYLOAD_MISSING_USER_MESSAGE,
+    }
+
+
+def _rq_worker_name(worker_id: int) -> str:
+    host = socket.gethostname().split(".")[0][:32]
+    return (
+        f"chatvector-worker-{worker_id}-{host}-{os.getpid()}-{uuid.uuid4().hex[:8]}"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -86,17 +119,17 @@ async def _async_execute_job(
     from services.ingestion_pipeline import IngestionPipeline, UploadPipelineError
 
     async with worker_db_context():
-        _redis_conn = redis_lib.Redis.from_url(config.REDIS_URL)
+        _redis_conn = redis_lib.Redis.from_url(config.REDIS_URL, **redis_connection_kwargs())
         temp_path = Path(temp_file_path)
 
         if not temp_path.exists():
-            error_msg = f"Temp file missing for doc {doc_id}: {temp_file_path}"
-            logger.error(error_msg)
+            logger.error("Temp file missing for doc %s", doc_id)
+            error_payload = _job_payload_missing_error()
             try:
                 await db_module.update_document_status(
                     doc_id=doc_id,
                     status="failed",
-                    error={"stage": "queued", "message": error_msg},
+                    error=error_payload,
                     tenant_id=tenant_id,
                 )
             except Exception:
@@ -106,7 +139,7 @@ async def _async_execute_job(
                 file_name=file_name,
                 content_type=content_type,
                 attempt=attempt,
-                error=error_msg,
+                error="job_payload_missing",
                 tenant_id=tenant_id,
             ), conn=_redis_conn)
             return
@@ -114,13 +147,17 @@ async def _async_execute_job(
         try:
             file_bytes = temp_path.read_bytes()
         except OSError as exc:
-            error_msg = f"Cannot read temp file for doc {doc_id}: {exc}"
+            error_msg = f"Cannot read upload payload for doc {doc_id}: {exc}"
             logger.error(error_msg)
             try:
                 await db_module.update_document_status(
                     doc_id=doc_id,
                     status="failed",
-                    error={"stage": "queued", "message": error_msg},
+                    error={
+                        "code": "job_payload_unreadable",
+                        "stage": "queued",
+                        "message": JOB_PAYLOAD_MISSING_USER_MESSAGE,
+                    },
                     tenant_id=tenant_id,
                 )
             except Exception:
@@ -130,15 +167,12 @@ async def _async_execute_job(
                 file_name=file_name,
                 content_type=content_type,
                 attempt=attempt,
-                error=error_msg,
+                error="job_payload_unreadable",
                 tenant_id=tenant_id,
             ), conn=_redis_conn)
             return
 
-        rate_limiter = TokenBucketRateLimiter(
-            rate=config.QUEUE_EMBEDDING_RPS,
-            capacity=config.QUEUE_EMBEDDING_RPS,
-        )
+        rate_limiter = get_process_embedding_rate_limiter()
 
         pipeline = IngestionPipeline()
         try:
@@ -156,6 +190,23 @@ async def _async_execute_job(
                 logger.error(
                     "Document %s (%r) non-retryable error (HTTP %d) — DLQ: %s",
                     doc_id, file_name, exc.status_code, exc,
+                    exc_info=True,
+                )
+                _cleanup_temp_file(temp_path)
+                _push_dlq_entry(DLQEntry(
+                    doc_id=doc_id,
+                    file_name=file_name,
+                    content_type=content_type,
+                    attempt=attempt,
+                    error=str(exc),
+                    tenant_id=tenant_id,
+                ), conn=_redis_conn)
+                return
+
+            if not is_retryable_ingestion_failure(exc):
+                logger.error(
+                    "Document %s (%r) non-retryable error — DLQ: %s",
+                    doc_id, file_name, exc,
                     exc_info=True,
                 )
                 _cleanup_temp_file(temp_path)
@@ -188,6 +239,39 @@ async def _async_execute_job(
                     )
                 await asyncio.sleep(delay)
                 rq_queue = RQQueue(RQ_QUEUE_NAME, connection=_redis_conn)
+                if len(rq_queue) >= config.QUEUE_MAX_SIZE:
+                    error_msg = (
+                        f"Ingestion queue is at capacity ({config.QUEUE_MAX_SIZE})"
+                    )
+                    logger.error(
+                        "Document %s retry could not be requeued — %s",
+                        doc_id,
+                        error_msg,
+                    )
+                    try:
+                        await db_module.update_document_status(
+                            doc_id=doc_id,
+                            status="failed",
+                            tenant_id=tenant_id,
+                            error={
+                                "stage": "queued",
+                                "message": error_msg,
+                            },
+                        )
+                    except Exception as status_err:
+                        logger.error(
+                            "Failed to set failed status for %s: %s",
+                            doc_id, status_err,
+                        )
+                    _push_dlq_entry(DLQEntry(
+                        doc_id=doc_id,
+                        file_name=file_name,
+                        content_type=content_type,
+                        attempt=next_attempt,
+                        error=error_msg,
+                        tenant_id=tenant_id,
+                    ), conn=_redis_conn)
+                    return
                 rq_queue.enqueue(
                     _execute_job,
                     doc_id, file_name, content_type, temp_file_path, next_attempt, tenant_id,
@@ -222,9 +306,11 @@ def _push_dlq_entry(
     entry: DLQEntry,
     conn: redis_lib.Redis | None = None,
 ) -> None:
-    """Persist a DLQ entry as JSON in a Redis list."""
+    """Persist a DLQ entry as JSON in a Redis list, trimming to max length."""
     try:
-        _conn = conn or redis_lib.Redis.from_url(config.REDIS_URL)
+        _conn = conn or redis_lib.Redis.from_url(
+            config.REDIS_URL, **redis_connection_kwargs()
+        )
         data: dict = {
             "doc_id": entry.doc_id,
             "file_name": entry.file_name,
@@ -235,7 +321,12 @@ def _push_dlq_entry(
         }
         if entry.tenant_id is not None:
             data["tenant_id"] = entry.tenant_id
-        _conn.rpush(DLQ_REDIS_KEY, json.dumps(data))
+        payload = json.dumps(data)
+        max_entries = config.QUEUE_DLQ_MAX_ENTRIES
+        pipe = _conn.pipeline()
+        pipe.rpush(DLQ_REDIS_KEY, payload)
+        pipe.ltrim(DLQ_REDIS_KEY, -max_entries, -1)
+        pipe.execute()
     except Exception:
         logger.exception("Failed to push DLQ entry for %s", entry.doc_id)
 
@@ -247,14 +338,6 @@ class _NoopDeathPenalty:
     RQ's default death penalty uses SIGALRM which is only available
     in the main thread.  Jobs still have the RQ job_timeout enforced
     at the queue level; this only disables the in-process signal kill.
-
-    Known limitation: the job_timeout=600 passed during enqueue is
-    not enforced in-process. If a job hangs indefinitely, the worker
-    thread will block until the FastAPI process exits. The daemon=True
-    flag ensures threads don't prevent process shutdown, but a hung
-    job will occupy a worker slot until then. A custom timeout
-    mechanism (e.g. asyncio.wait_for in _async_execute_job) would
-    address this if needed.
     """
 
     def __init__(self, timeout, exception, **kwargs):
@@ -277,18 +360,30 @@ class ThreadSafeWorker(SimpleWorker):
     """
     RQ worker safe for use in non-main threads.
 
-    Three changes from the default Worker:
     - Inherits SimpleWorker to avoid os.fork() (runs jobs in-process)
-    - Overrides _install_signal_handlers() as a no-op because
-      signal.signal() raises ValueError in non-main threads
-    - Uses _NoopDeathPenalty instead of UnixSignalDeathPenalty because
-      SIGALRM is unavailable outside the main thread
+    - Overrides _install_signal_handlers() as a no-op
+    - Uses _NoopDeathPenalty instead of UnixSignalDeathPenalty
+    - Short dequeue_timeout so stop() can join worker threads promptly
+    - Tracks ``listening`` after successful bootstrap for status metrics
     """
 
     death_penalty_class = _NoopDeathPenalty
+    listening = False
+
+    @property
+    def dequeue_timeout(self):
+        return 1
+
+    def bootstrap(self, *args, **kwargs):
+        super().bootstrap(*args, **kwargs)
+        self.listening = True
+
+    def teardown(self):
+        self.listening = False
+        super().teardown()
 
     def _install_signal_handlers(self) -> None:
-        pass  # signal handlers cannot be set outside the main thread
+        pass
 
 
 # ---------------------------------------------------------------------------
@@ -297,23 +392,31 @@ class ThreadSafeWorker(SimpleWorker):
 
 class RedisIngestionQueue(BaseIngestionQueue):
     """
-    RQ-backed ingestion queue.  File bytes are spilled to /tmp/chatvector/
+    RQ-backed ingestion queue.  File bytes are spilled to ``QUEUE_SPILL_DIR``
     and only metadata flows through Redis.
     """
 
     def __init__(self) -> None:
-        self._conn = redis_lib.Redis.from_url(config.REDIS_URL)
+        self._conn = redis_lib.Redis.from_url(
+            config.REDIS_URL, **redis_connection_kwargs()
+        )
         self._rq_queue = RQQueue(RQ_QUEUE_NAME, connection=self._conn)
         self._worker_threads: list[threading.Thread] = []
+        self._rq_workers: list[Optional[ThreadSafeWorker]] = []
         self._stop_event = threading.Event()
-        TEMP_DIR.mkdir(parents=True, exist_ok=True)
+        spill_dir()
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     async def start(self) -> None:
-        """Spawn RQ worker threads (one per QUEUE_WORKER_COUNT)."""
+        """Spawn RQ worker threads (one per QUEUE_WORKER_COUNT). Idempotent."""
+        if self._worker_threads:
+            return
+
+        self._stop_event.clear()
+        self._rq_workers = [None] * config.QUEUE_WORKER_COUNT
         for i in range(config.QUEUE_WORKER_COUNT):
             t = threading.Thread(
                 target=self._run_worker,
@@ -325,32 +428,43 @@ class RedisIngestionQueue(BaseIngestionQueue):
             self._worker_threads.append(t)
         logger.info(
             "Redis ingestion queue started with %d worker thread(s) "
-            "(max_size=%d, redis=%s)",
+            "(max_size=%d, redis=%s, spill_dir=%s)",
             config.QUEUE_WORKER_COUNT,
             config.QUEUE_MAX_SIZE,
             config.REDIS_URL,
+            config.QUEUE_SPILL_DIR,
         )
 
     async def stop(self) -> None:
-        """Signal workers to stop and join threads."""
+        """Signal workers to stop and join threads off the event loop."""
         self._stop_event.set()
-        for t in self._worker_threads:
-            t.join(timeout=5.0)
+        for worker in self._rq_workers:
+            if worker is not None:
+                worker._stop_requested = True
+        await asyncio.to_thread(self._join_worker_threads, 5.0)
         self._worker_threads.clear()
+        self._rq_workers.clear()
         logger.info("Redis ingestion queue stopped")
+
+    def _join_worker_threads(self, timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        for t in self._worker_threads:
+            remaining = max(0.0, deadline - time.monotonic())
+            t.join(timeout=remaining)
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
-    async def enqueue(self, job: QueueJob) -> int:
+    def _sync_enqueue(self, job: QueueJob) -> int:
+        """Blocking RQ enqueue + temp-file write (runs off the event loop)."""
         current_size = len(self._rq_queue)
         if current_size >= config.QUEUE_MAX_SIZE:
             raise QueueFull(
                 f"Ingestion queue is at capacity ({config.QUEUE_MAX_SIZE})"
             )
 
-        temp_file_path = TEMP_DIR / job.doc_id
+        temp_file_path = spill_dir() / job.doc_id
         temp_file_path.write_bytes(job.file_bytes)
 
         self._rq_queue.enqueue(
@@ -365,7 +479,11 @@ class RedisIngestionQueue(BaseIngestionQueue):
             job_timeout=600,
         )
 
-        position = len(self._rq_queue)
+        position = self.queue_position(job.doc_id)
+        return position if position is not None else 1
+
+    async def enqueue(self, job: QueueJob) -> int:
+        position = await asyncio.to_thread(self._sync_enqueue, job)
         logger.info(
             "Enqueued document %s (file=%r, position=%d) [redis]",
             job.doc_id, job.file_name, position,
@@ -402,7 +520,12 @@ class RedisIngestionQueue(BaseIngestionQueue):
         return result
 
     def active_worker_count(self) -> int:
-        return len([t for t in self._worker_threads if t.is_alive()])
+        """Workers in this API process that finished RQ bootstrap and are listening."""
+        return sum(
+            1
+            for worker in self._rq_workers
+            if worker is not None and worker.listening and not worker._stop_requested
+        )
 
     def clear_stale_jobs(self, failed_doc_ids: set[str]) -> int:
         """
@@ -436,13 +559,17 @@ class RedisIngestionQueue(BaseIngestionQueue):
         """Run a ThreadSafeWorker in a loop; restarts on unexpected exit."""
         logger.info("RQ worker thread-%d starting", worker_id)
         while not self._stop_event.is_set():
+            worker: ThreadSafeWorker | None = None
             try:
-                worker_conn = redis_lib.Redis.from_url(config.REDIS_URL)
+                worker_conn = redis_lib.Redis.from_url(
+                    config.REDIS_URL, **redis_connection_kwargs()
+                )
                 worker = ThreadSafeWorker(
                     [RQ_QUEUE_NAME],
                     connection=worker_conn,
-                    name=f"chatvector-worker-{worker_id}-{os.getpid()}",
+                    name=_rq_worker_name(worker_id),
                 )
+                self._rq_workers[worker_id] = worker
                 worker.work(
                     burst=False,
                     logging_level=logging.WARNING,
@@ -465,6 +592,12 @@ class RedisIngestionQueue(BaseIngestionQueue):
                     )
                     time.sleep(1.0)
                     continue
+            finally:
+                if worker is not None:
+                    worker.listening = False
+                if worker_id < len(self._rq_workers):
+                    self._rq_workers[worker_id] = None
+
             if not self._stop_event.is_set():
                 logger.warning(
                     "RQ worker thread-%d exited unexpectedly, restarting in 1s",

@@ -8,6 +8,7 @@ cached at module level (kept public so tests can reset them).
 from __future__ import annotations
 
 import logging
+import threading
 
 from core.config import config
 from services.providers.base import EmbeddingProvider, LLMProvider
@@ -19,6 +20,7 @@ logger = logging.getLogger(__name__)
 # Current singleton pattern will be replaced.
 _embedding_provider: EmbeddingProvider | None = None
 _llm_provider: LLMProvider | None = None
+_provider_lock = threading.Lock()
 
 
 def get_embedding_provider() -> EmbeddingProvider:
@@ -28,39 +30,43 @@ def get_embedding_provider() -> EmbeddingProvider:
     if _embedding_provider is not None:
         return _embedding_provider
 
-    name = config.EMBEDDING_PROVIDER
+    with _provider_lock:
+        if _embedding_provider is not None:
+            return _embedding_provider
 
-    if name == "gemini":
-        from services.providers.gemini import GeminiEmbeddingProvider
+        name = config.EMBEDDING_PROVIDER
 
-        _embedding_provider = GeminiEmbeddingProvider()
-        logger.info("Using Gemini embedding provider")
+        if name == "gemini":
+            from services.providers.gemini import GeminiEmbeddingProvider
 
-    elif name == "openai":
-        from services.providers.openai import OpenAIEmbeddingProvider
+            _embedding_provider = GeminiEmbeddingProvider()
+            logger.info("Using Gemini embedding provider")
 
-        _embedding_provider = OpenAIEmbeddingProvider()
-        logger.info("Using OpenAI embedding provider")
+        elif name == "openai":
+            from services.providers.openai import OpenAIEmbeddingProvider
 
-    elif name == "ollama":
-        from services.providers.ollama import OllamaEmbeddingProvider
+            _embedding_provider = OpenAIEmbeddingProvider()
+            logger.info("Using OpenAI embedding provider")
 
-        _embedding_provider = OllamaEmbeddingProvider()
-        logger.info("Using Ollama embedding provider")
+        elif name == "ollama":
+            from services.providers.ollama import OllamaEmbeddingProvider
 
-    elif name == "voyage":
-        from services.providers.voyage import VoyageEmbeddingProvider
+            _embedding_provider = OllamaEmbeddingProvider()
+            logger.info("Using Ollama embedding provider")
 
-        _embedding_provider = VoyageEmbeddingProvider()
-        logger.info("Using Voyage AI embedding provider")
+        elif name == "voyage":
+            from services.providers.voyage import VoyageEmbeddingProvider
 
-    else:
-        raise ValueError(
-            f"Unknown EMBEDDING_PROVIDER={name!r}. "
-            f"Expected one of: gemini, openai, ollama, voyage."
-        )
+            _embedding_provider = VoyageEmbeddingProvider()
+            logger.info("Using Voyage AI embedding provider")
 
-    return _embedding_provider
+        else:
+            raise ValueError(
+                f"Unknown EMBEDDING_PROVIDER={name!r}. "
+                f"Expected one of: gemini, openai, ollama, voyage."
+            )
+
+        return _embedding_provider
 
 
 def get_llm_provider() -> LLMProvider:
@@ -70,36 +76,40 @@ def get_llm_provider() -> LLMProvider:
     if _llm_provider is not None:
         return _llm_provider
 
-    name = config.LLM_PROVIDER
+    with _provider_lock:
+        if _llm_provider is not None:
+            return _llm_provider
 
-    if name == "gemini":
-        from services.providers.gemini import GeminiLLMProvider
+        name = config.LLM_PROVIDER
 
-        _llm_provider = GeminiLLMProvider()
-        logger.info("Using Gemini LLM provider")
+        if name == "gemini":
+            from services.providers.gemini import GeminiLLMProvider
 
-    elif name == "openai":
-        from services.providers.openai import OpenAILLMProvider
+            _llm_provider = GeminiLLMProvider()
+            logger.info("Using Gemini LLM provider")
 
-        _llm_provider = OpenAILLMProvider()
-        logger.info("Using OpenAI LLM provider")
+        elif name == "openai":
+            from services.providers.openai import OpenAILLMProvider
 
-    elif name == "ollama":
-        from services.providers.ollama import OllamaLLMProvider
+            _llm_provider = OpenAILLMProvider()
+            logger.info("Using OpenAI LLM provider")
 
-        _llm_provider = OllamaLLMProvider()
-        logger.info("Using Ollama LLM provider")
+        elif name == "ollama":
+            from services.providers.ollama import OllamaLLMProvider
 
-    elif name == "anthropic":
-        from services.providers.anthropic import AnthropicLLMProvider
+            _llm_provider = OllamaLLMProvider()
+            logger.info("Using Ollama LLM provider")
 
-        _llm_provider = AnthropicLLMProvider()
-        logger.info("Using Anthropic LLM provider")
+        elif name == "anthropic":
+            from services.providers.anthropic import AnthropicLLMProvider
 
-    else:
-        raise ValueError(
-            f"Unknown LLM_PROVIDER={name!r}. "
-            f"Expected one of: gemini, openai, ollama, anthropic."
-        )
+            _llm_provider = AnthropicLLMProvider()
+            logger.info("Using Anthropic LLM provider")
 
-    return _llm_provider
+        else:
+            raise ValueError(
+                f"Unknown LLM_PROVIDER={name!r}. "
+                f"Expected one of: gemini, openai, ollama, anthropic."
+            )
+
+        return _llm_provider

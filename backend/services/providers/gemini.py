@@ -91,7 +91,12 @@ class GeminiEmbeddingProvider(EmbeddingProvider):
         model: str | None = None,
     ) -> None:
         self._model = model or config.EMBEDDING_MODEL or _DEFAULT_EMBEDDING_MODEL
-        self._client = genai.Client(api_key=api_key or config.GEN_AI_KEY)
+        self._client = genai.Client(
+            api_key=api_key or config.GEN_AI_KEY,
+            http_options=genai_types.HttpOptions(
+                timeout=int(config.EMBEDDING_HTTP_TIMEOUT_SEC * 1000),
+            ),
+        )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Embed *texts* in batches of at most ``_BATCH_SIZE``."""

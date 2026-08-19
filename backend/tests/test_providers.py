@@ -733,3 +733,48 @@ class TestEmbeddingDimResolution:
 
         provider = OllamaEmbeddingProvider(model="registry/nomic-embed-text")
         assert provider.embedding_dim == 768
+
+
+class TestProviderSdkRetryOwnership:
+    def test_openai_clients_disable_sdk_retries(self):
+        from services.providers.openai import OpenAIEmbeddingProvider, OpenAILLMProvider
+
+        embed = OpenAIEmbeddingProvider(api_key="test-key")
+        llm = OpenAILLMProvider(api_key="test-key")
+        assert embed._client.max_retries == 0
+        assert llm._client.max_retries == 0
+
+    def test_anthropic_client_disables_sdk_retries(self):
+        from services.providers.anthropic import AnthropicLLMProvider
+
+        provider = AnthropicLLMProvider(api_key="test-key")
+        assert provider._client.max_retries == 0
+
+
+class TestGeminiHttpTimeouts:
+    def test_embedding_client_configures_http_timeout_ms(self):
+        from unittest.mock import patch
+
+        from google.genai import types as genai_types
+        from services.providers.gemini import GeminiEmbeddingProvider
+        from core.config import config
+
+        expected = int(config.EMBEDDING_HTTP_TIMEOUT_SEC * 1000)
+        with patch("services.providers.gemini.genai.Client") as mock_client:
+            GeminiEmbeddingProvider(api_key="test-key")
+            kwargs = mock_client.call_args.kwargs
+            assert isinstance(kwargs["http_options"], genai_types.HttpOptions)
+            assert kwargs["http_options"].timeout == expected
+
+    def test_llm_client_configures_http_timeout_ms(self):
+        from unittest.mock import patch
+
+        from google.genai import types as genai_types
+        from services.providers.gemini import GeminiLLMProvider
+        from core.config import config
+
+        with patch("services.providers.gemini.genai.Client") as mock_client:
+            GeminiLLMProvider(api_key="test-key")
+            kwargs = mock_client.call_args.kwargs
+            assert isinstance(kwargs["http_options"], genai_types.HttpOptions)
+            assert kwargs["http_options"].timeout == config.LLM_HTTP_TIMEOUT_MS

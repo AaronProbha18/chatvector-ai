@@ -68,6 +68,7 @@ services:
     working_dir: /app
     volumes:
       - ./backend:/app
+      - ./docker-compose.prod.yml:/docker-compose.prod.yml:ro
     environment:
       # 👇 Same fix here
       DATABASE_URL: "postgresql+asyncpg://postgres:postgres@db:5432/postgres"

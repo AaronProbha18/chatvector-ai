@@ -75,6 +75,7 @@ class OpenAIEmbeddingProvider(EmbeddingProvider):
             api_key=api_key or config.OPENAI_API_KEY,
             base_url=base_url or config.OPENAI_BASE_URL,
             timeout=float(config.EMBEDDING_HTTP_TIMEOUT_SEC),
+            max_retries=0,
         )
 
     async def embed(self, texts: list[str]) -> list[list[float]]:
@@ -109,6 +110,7 @@ class OpenAILLMProvider(LLMProvider):
             api_key=api_key or config.OPENAI_API_KEY,
             base_url=base_url or config.OPENAI_BASE_URL,
             timeout=float(config.LLM_HTTP_TIMEOUT_MS) / 1000.0,
+            max_retries=0,
         )
 
     async def generate(

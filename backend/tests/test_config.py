@@ -1,5 +1,8 @@
 import pytest
-from core.config import get_embedding_dim
+from core.config import STALE_INGESTION_STATUSES, get_embedding_dim
+
+def test_stale_ingestion_statuses_include_uploaded():
+    assert "uploaded" in STALE_INGESTION_STATUSES
 
 def test_get_embedding_dim_valid_int(monkeypatch):
     monkeypatch.setenv("EMBEDDING_DIM", "1536")

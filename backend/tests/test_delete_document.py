@@ -35,7 +35,7 @@ async def test_delete_document_not_found():
     assert excinfo.value.detail["code"] == "document_not_found"
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", ["queued", "retrying", "extracting", "chunking", "embedding", "storing"])
+@pytest.mark.parametrize("status", ["uploaded", "queued", "retrying", "extracting", "chunking", "embedding", "storing"])
 async def test_delete_document_conflict(status):
     payload = {
         "document_id": "doc-1",
@@ -51,7 +51,8 @@ async def test_delete_document_conflict(status):
     assert excinfo.value.detail["code"] == "document_processing"
 
 @pytest.mark.asyncio
-async def test_delete_document_queue_conflict():
+async def test_delete_document_uploaded_in_queue_reports_processing():
+    """Uploaded is a stale/in-progress status; delete conflicts before queue check."""
     payload = {
         "document_id": "doc-1",
         "status": "uploaded",
@@ -64,4 +65,4 @@ async def test_delete_document_queue_conflict():
                 )
 
     assert excinfo.value.status_code == 409
-    assert excinfo.value.detail["code"] == "document_queued"
+    assert excinfo.value.detail["code"] == "document_processing"

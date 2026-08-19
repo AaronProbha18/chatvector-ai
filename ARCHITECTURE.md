@@ -167,8 +167,9 @@ An async in-memory `asyncio.Queue` decouples upload from processing.
 
 **Key properties:**
 - Bounded queue (`QUEUE_MAX_SIZE`, default 100) — uploads beyond capacity return 503
+- Redis backend capacity is an approximate bound under highly concurrent enqueues; the in-memory queue enforces capacity atomically within the process
 - Worker pool (`QUEUE_WORKER_COUNT`, default 3, max 5)
-- Token bucket rate limiter (`QUEUE_EMBEDDING_RPS`, default 2.0/sec) — caps Gemini embedding API calls across all workers
+- Token bucket rate limiter (`QUEUE_EMBEDDING_RPS`, default 2.0/sec) — caps embedding HTTP batches per API process across all queue workers
 - Exponential backoff with jitter between job retries
 - 4xx `UploadPipelineError` failures (e.g. no text extracted) go directly to DLQ without consuming retries
 - Transient failures retry up to `QUEUE_JOB_MAX_RETRIES` times, then move to DLQ
@@ -181,11 +182,20 @@ An async in-memory `asyncio.Queue` decouples upload from processing.
 
 **On server restart:**
 Documents left in any in-progress state are bulk-updated to `failed`
-before workers start accepting new jobs.
+before workers start accepting new jobs. This reconciliation is safe under
+the supported single-process API topology only.
 
 > **Note:** The default queue is in-memory for local development. In production
 > (`APP_ENV=production`), the Redis-backed queue is the default for job durability
-> and multi-instance support. Set `QUEUE_BACKEND=memory` explicitly to override.
+> across API restarts. Set `QUEUE_BACKEND=memory` explicitly to override.
+>
+> **Production topology:** Phase 3 supports **one API process/container**
+> (`uvicorn --workers 1`). Redis/RQ worker threads provide ingestion concurrency
+> within that process. Running multiple API processes or containers is not
+> currently supported. Redis does not by itself make API instances horizontally
+> scalable. Concurrency settings such as `QUEUE_WORKER_COUNT`,
+> `RETRIEVAL_MAX_CONCURRENCY`, DB pool sizes, and `QUEUE_EMBEDDING_RPS` are
+> process-scoped.
 
 ---
 
@@ -267,31 +277,35 @@ for legal, academic, and internal knowledge base use cases.
 
 ## Retry Logic & Resilience
 
-All external I/O is wrapped with retry logic via `backend/utils/retry.py`.
+Selected backend I/O paths use shared retry logic via `backend/utils/retry.py`.
 See [DEVELOPMENT.md — Retry behavior](DEVELOPMENT.md#retry-behavior) for the
 full cross-surface contract and audit checklist.
 
 **`retry_async` features:**
-- Per-attempt timeout via `asyncio.wait_for` (default 30s)
+- Per-attempt timeout via `asyncio.wait_for` (DB: `SQLALCHEMY_STATEMENT_TIMEOUT_SEC + 5`)
+- `retry_on_timeout=False` on non-idempotent DB writes
 - Exponential backoff with full jitter — `random.uniform(0, cap)` prevents thundering herd
-- `asyncio.TimeoutError` caught by type and always treated as transient
-- Provider rate limits, timeouts, and connection errors detected by exception type
-- Non-transient errors (4xx validation failures) fail fast without retry
+- `asyncio.TimeoutError` retried by default except when `retry_on_timeout=False`
+- Provider rate limits, timeouts, and connection errors detected by structured exception types
+- Non-transient errors (4xx validation failures, generic `ProviderError`) fail fast without retry
 - `max_retries` means retries *after* the first attempt — `max_retries=3` makes 4 total attempts
+- OpenAI/Anthropic SDK internal retries disabled (`max_retries=0`); backend owns retry policy
 
 **Where retries apply:**
-- DB factory operations and embedding calls use shared defaults (`DEFAULT_MAX_RETRIES=3`)
-- Non-streaming LLM answer generation retries transient provider failures
+- DB factory operations (with per-operation exceptions documented in DEVELOPMENT.md)
+- Embedding and non-streaming LLM answer generation use shared defaults (`DEFAULT_MAX_RETRIES=3`)
 - Streaming LLM responses are not retried after bytes may have started
+- Ingestion queue retries only transient failures; capacity-safe requeue (DLQ when full)
 
 **Timeout configuration:**
 | Surface | Timeout | Mechanism |
 | --- | --- | --- |
-| DB operations | 10s per attempt | `retry_async(timeout=10.0)` |
-| Embedding calls | 30s per attempt | `retry_async(timeout=30.0)` |
-| LLM HTTP client | 60s | `HttpOptions(timeout=LLM_HTTP_TIMEOUT_MS)` |
+| DB operations (outer) | `SQLALCHEMY_STATEMENT_TIMEOUT_SEC + 5` | `retry_async` + `asyncio.wait_for` |
+| DB operations (asyncpg) | `SQLALCHEMY_STATEMENT_TIMEOUT_SEC` | asyncpg client `command_timeout` (not server `statement_timeout`) |
+| Embedding calls | `EMBEDDING_HTTP_TIMEOUT_SEC` | provider HTTP client + outer `retry_async` |
+| LLM HTTP client | `LLM_HTTP_TIMEOUT_MS` | SDK/`HttpOptions` timeout (ms) |
+| Redis clients | `REDIS_SOCKET_TIMEOUT_SEC` (default 5s) | `socket_timeout` + `socket_connect_timeout` |
 | SQLAlchemy pool | 30s checkout | `pool_timeout` on engine |
-| SQLAlchemy queries | 30s | `command_timeout` on asyncpg |
 | Health checks | 10s (embed), 15s (LLM) | `asyncio.wait_for` |
 
 ---
@@ -354,7 +368,7 @@ The raw key is printed once and never stored. Set it in all API clients as the B
 
 **Auth non-goals:** ChatVector does not provide user login/signup, OAuth, RBAC, billing, or an API-key management UI. Keys are managed via CLI (`create-tenant-key`, `list-tenant-keys`, `revoke-tenant-key`, `rotate-tenant-key`, `set-tenant-key-expiry`, `set-tenant-key-external-user-id`) or direct DB updates.
 
-**Session persistence:** All session state is now fully durable. Chat message turns are stored in `chat_messages`. Session metadata (`id`, `tenant_id`, `created_at`, `last_active`) is stored in the `sessions` table and document bindings are stored in `session_documents` — both introduced by migration `007_sessions.sql`. `backend/services/session_service.py` reads and writes exclusively through `SQLAlchemyService`; the previous in-memory `_SESSIONS` dict has been removed. Sessions survive backend restarts and are shared across all Uvicorn workers (`docker-compose.prod.yml` runs `--workers 2`).
+**Session persistence:** All session state is now fully durable. Chat message turns are stored in `chat_messages`. Session metadata (`id`, `tenant_id`, `created_at`, `last_active`) is stored in the `sessions` table and document bindings are stored in `session_documents` — both introduced by migration `007_sessions.sql`. `backend/services/session_service.py` reads and writes exclusively through `SQLAlchemyService`; the previous in-memory `_SESSIONS` dict has been removed. Sessions survive backend restarts. The production Compose stack runs a single Uvicorn worker process per API container (`--workers 1`).
 
 ---
 

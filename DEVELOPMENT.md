@@ -552,7 +552,9 @@ same field — they are not interchangeable across fields or with `score`.
 ```env
 QUEUE_WORKER_COUNT=3      # concurrent background workers (1–5)
 QUEUE_MAX_SIZE=100        # max pending jobs; uploads beyond this return 503
-QUEUE_EMBEDDING_RPS=2.0   # max embedding API calls/sec across workers
+QUEUE_EMBEDDING_RPS=2.0   # max embedding HTTP batches/sec per API process (burst = same value)
+QUEUE_SPILL_DIR=/tmp/chatvector  # local spill dir for Redis queue file bytes (one API container)
+QUEUE_DLQ_MAX_ENTRIES=1000  # max dead-letter records retained
 QUEUE_JOB_MAX_RETRIES=3   # retries before a job moves to DLQ
 QUEUE_RETRY_BASE_DELAY=2.0 # base seconds for retry backoff
 ```
@@ -628,7 +630,7 @@ mutating HTTP requests.
 | Backoff multiplier | 2.0 | 2.0 | 2× per retry index |
 | Jitter | Full jitter: `uniform(0, cap)` | Full jitter with 8s cap | Full jitter with 8s cap |
 | `Retry-After` | Not parsed at backend layer | Numeric delta-seconds only (floors sleep via `WantsRetry`); HTTP-date values ignored | Parses delta-seconds and HTTP-date via `parseRetryAfter` |
-| Per-attempt timeout | Yes (`asyncio.wait_for`) | httpx client timeout (30s default) | Per-request timeout (30s default) |
+| Per-attempt timeout | Yes (`asyncio.wait_for`; DB deadline = `SQLALCHEMY_STATEMENT_TIMEOUT_SEC + 5`) | httpx client timeout (30s default) | Per-request timeout (30s default) |
 
 ### Retryable errors
 
@@ -636,20 +638,28 @@ mutating HTTP requests.
 
 - `asyncio.TimeoutError`
 - `ProviderRateLimitError`, `ProviderTimeoutError`, `ProviderConnectionError`
-- Message patterns: connection, timeout, deadlock, rate limit, unavailable, etc.
-- Non-transient provider/auth/validation errors fail fast
+- SQLAlchemy `IntegrityError`, `DataError`, and `ProgrammingError` are **never** transient (even when bound parameters contain words like "timeout")
+- Other DB/driver errors: message patterns on the underlying driver/original exception only
+- Generic `ProviderError` and `ProviderAuthError` fail fast (message substrings are not used)
+- Ollama/Voyage map HTTP `408`, `429`, `502`, `503`, `504` to the structured transient types above (`500` is not retried)
 
-**HTTP status codes** (SDK clients and documentation): `408`, `429`, `502`, `503`, `504`
+**HTTP status codes** (SDK clients and documentation): `408`, `429`, `502`, `503`, `504` (not `500`)
 
 ### Where retries apply
 
 | Surface | Retries? | Notes |
 | --- | --- | --- |
-| DB factory (`db/__init__.py`) | Yes | Most ops use shared defaults; some status updates use `base_delay=0.5` |
-| Embedding service | Yes | Wraps provider `embed()` |
+| DB factory (`db/__init__.py`) | Yes | Most ops; non-idempotent writes use `retry_on_timeout=False` |
+| DB writes (`create_document`, chunk storage, atomic upload) | Connection/transient only | No retry after ambiguous client timeout |
+| Session reads/deletes/bindings | Yes | `list_session_records`, `get_session_record`, etc. |
+| `store_chat_message` / `create_session_record` | No | Not idempotent under timeout retry |
+| `list_applied_migrations` | No | Startup has its own bounded retry loop |
+| Embedding service | Yes | Wraps provider `embed()`; OpenAI/Anthropic SDK retries disabled (`max_retries=0`) |
 | LLM answer generation (non-streaming) | Yes | Wraps provider `generate()`; streaming is not retried |
 | LLM streaming | No | Bytes may have started — explicit non-goal |
+| Query transformation | No | Soft-fails without backend retry |
 | HTTP middleware (`POST /chat`, upload) | No | Explicit non-goal |
+| Ingestion queue job failures | Selective | Retries only when `is_transient_error()`; auth/parse/programming errors → DLQ |
 | Python/TS SDK `GET`/`HEAD` | Yes | Safe, idempotent reads |
 | Python/TS SDK mutating methods | No | Upload, chat, sessions, streaming |
 
@@ -680,7 +690,7 @@ mounts live backend code and uses development defaults.
 
 `docker-compose.prod.yml` is a **standalone** file — it does not
 extend or merge with `docker-compose.yml`. It disables code bind
-mounts, runs multi-worker uvicorn, enables JSON logging, and applies
+mounts, runs single-process uvicorn (`--workers 1`), enables JSON logging, and applies
 resource limits.
 
 ```bash
@@ -874,14 +884,15 @@ environment:
 ```
 
 The production API runs with a single Uvicorn worker process in the Compose
-container:
+container (Phase 3 supported topology):
 
 ```yaml
-command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+command: ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "1"]
 ```
 
-This keeps the API container's in-process background worker configuration
-predictable while the E2E test exercises the Redis-backed ingestion queue.
+RQ worker threads (`QUEUE_WORKER_COUNT`) provide ingestion concurrency within
+that one API process. Running multiple Uvicorn workers or API containers is not
+supported in Phase 3.
 
 The API container has a 1 GB memory limit:
 
