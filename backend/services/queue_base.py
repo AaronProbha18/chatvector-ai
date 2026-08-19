@@ -120,3 +120,10 @@ class BaseIngestionQueue(ABC):
         No-op for backends that don't persist jobs across restarts.
         """
         return 0
+
+
+def is_retryable_ingestion_failure(exc: Exception) -> bool:
+    """Return True when a failed ingestion job should consume retry budget."""
+    from utils.retry import is_transient_error
+
+    return is_transient_error(exc)

@@ -49,6 +49,7 @@ class AnthropicLLMProvider(LLMProvider):
             api_key=api_key or config.ANTHROPIC_API_KEY,
             base_url=base_url or config.ANTHROPIC_BASE_URL,
             timeout=float(config.LLM_HTTP_TIMEOUT_MS) / 1000.0,
+            max_retries=0,
         )
 
     async def generate(

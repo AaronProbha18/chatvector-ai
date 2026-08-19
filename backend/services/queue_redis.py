@@ -34,13 +34,14 @@ from rq import Queue as RQQueue
 from rq import SimpleWorker
 from rq.job import Job as RQJob
 
-from core.config import config
+from core.config import config, redis_connection_kwargs
 from services.queue_base import (
     BaseIngestionQueue,
     DLQEntry,
     QueueFull,
     QueueJob,
     TokenBucketRateLimiter,
+    is_retryable_ingestion_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -86,7 +87,7 @@ async def _async_execute_job(
     from services.ingestion_pipeline import IngestionPipeline, UploadPipelineError
 
     async with worker_db_context():
-        _redis_conn = redis_lib.Redis.from_url(config.REDIS_URL)
+        _redis_conn = redis_lib.Redis.from_url(config.REDIS_URL, **redis_connection_kwargs())
         temp_path = Path(temp_file_path)
 
         if not temp_path.exists():
@@ -169,6 +170,23 @@ async def _async_execute_job(
                 ), conn=_redis_conn)
                 return
 
+            if not is_retryable_ingestion_failure(exc):
+                logger.error(
+                    "Document %s (%r) non-retryable error — DLQ: %s",
+                    doc_id, file_name, exc,
+                    exc_info=True,
+                )
+                _cleanup_temp_file(temp_path)
+                _push_dlq_entry(DLQEntry(
+                    doc_id=doc_id,
+                    file_name=file_name,
+                    content_type=content_type,
+                    attempt=attempt,
+                    error=str(exc),
+                    tenant_id=tenant_id,
+                ), conn=_redis_conn)
+                return
+
             if attempt < config.QUEUE_JOB_MAX_RETRIES:
                 next_attempt = attempt + 1
                 cap = config.QUEUE_RETRY_BASE_DELAY * (2 ** next_attempt)
@@ -188,6 +206,39 @@ async def _async_execute_job(
                     )
                 await asyncio.sleep(delay)
                 rq_queue = RQQueue(RQ_QUEUE_NAME, connection=_redis_conn)
+                if len(rq_queue) >= config.QUEUE_MAX_SIZE:
+                    error_msg = (
+                        f"Ingestion queue is at capacity ({config.QUEUE_MAX_SIZE})"
+                    )
+                    logger.error(
+                        "Document %s retry could not be requeued — %s",
+                        doc_id,
+                        error_msg,
+                    )
+                    try:
+                        await db_module.update_document_status(
+                            doc_id=doc_id,
+                            status="failed",
+                            tenant_id=tenant_id,
+                            error={
+                                "stage": "queued",
+                                "message": error_msg,
+                            },
+                        )
+                    except Exception as status_err:
+                        logger.error(
+                            "Failed to set failed status for %s: %s",
+                            doc_id, status_err,
+                        )
+                    _push_dlq_entry(DLQEntry(
+                        doc_id=doc_id,
+                        file_name=file_name,
+                        content_type=content_type,
+                        attempt=next_attempt,
+                        error=error_msg,
+                        tenant_id=tenant_id,
+                    ), conn=_redis_conn)
+                    return
                 rq_queue.enqueue(
                     _execute_job,
                     doc_id, file_name, content_type, temp_file_path, next_attempt, tenant_id,
@@ -224,7 +275,9 @@ def _push_dlq_entry(
 ) -> None:
     """Persist a DLQ entry as JSON in a Redis list."""
     try:
-        _conn = conn or redis_lib.Redis.from_url(config.REDIS_URL)
+        _conn = conn or redis_lib.Redis.from_url(
+            config.REDIS_URL, **redis_connection_kwargs()
+        )
         data: dict = {
             "doc_id": entry.doc_id,
             "file_name": entry.file_name,
@@ -302,7 +355,9 @@ class RedisIngestionQueue(BaseIngestionQueue):
     """
 
     def __init__(self) -> None:
-        self._conn = redis_lib.Redis.from_url(config.REDIS_URL)
+        self._conn = redis_lib.Redis.from_url(
+            config.REDIS_URL, **redis_connection_kwargs()
+        )
         self._rq_queue = RQQueue(RQ_QUEUE_NAME, connection=self._conn)
         self._worker_threads: list[threading.Thread] = []
         self._stop_event = threading.Event()
@@ -343,7 +398,8 @@ class RedisIngestionQueue(BaseIngestionQueue):
     # Public API
     # ------------------------------------------------------------------
 
-    async def enqueue(self, job: QueueJob) -> int:
+    def _sync_enqueue(self, job: QueueJob) -> int:
+        """Blocking RQ enqueue + temp-file write (runs off the event loop)."""
         current_size = len(self._rq_queue)
         if current_size >= config.QUEUE_MAX_SIZE:
             raise QueueFull(
@@ -365,7 +421,10 @@ class RedisIngestionQueue(BaseIngestionQueue):
             job_timeout=600,
         )
 
-        position = len(self._rq_queue)
+        return len(self._rq_queue)
+
+    async def enqueue(self, job: QueueJob) -> int:
+        position = await asyncio.to_thread(self._sync_enqueue, job)
         logger.info(
             "Enqueued document %s (file=%r, position=%d) [redis]",
             job.doc_id, job.file_name, position,
@@ -437,7 +496,9 @@ class RedisIngestionQueue(BaseIngestionQueue):
         logger.info("RQ worker thread-%d starting", worker_id)
         while not self._stop_event.is_set():
             try:
-                worker_conn = redis_lib.Redis.from_url(config.REDIS_URL)
+                worker_conn = redis_lib.Redis.from_url(
+                    config.REDIS_URL, **redis_connection_kwargs()
+                )
                 worker = ThreadSafeWorker(
                     [RQ_QUEUE_NAME],
                     connection=worker_conn,

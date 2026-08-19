@@ -628,7 +628,7 @@ mutating HTTP requests.
 | Backoff multiplier | 2.0 | 2.0 | 2× per retry index |
 | Jitter | Full jitter: `uniform(0, cap)` | Full jitter with 8s cap | Full jitter with 8s cap |
 | `Retry-After` | Not parsed at backend layer | Numeric delta-seconds only (floors sleep via `WantsRetry`); HTTP-date values ignored | Parses delta-seconds and HTTP-date via `parseRetryAfter` |
-| Per-attempt timeout | Yes (`asyncio.wait_for`) | httpx client timeout (30s default) | Per-request timeout (30s default) |
+| Per-attempt timeout | Yes (`asyncio.wait_for`; DB deadline = `SQLALCHEMY_STATEMENT_TIMEOUT_SEC + 5`) | httpx client timeout (30s default) | Per-request timeout (30s default) |
 
 ### Retryable errors
 
@@ -636,20 +636,28 @@ mutating HTTP requests.
 
 - `asyncio.TimeoutError`
 - `ProviderRateLimitError`, `ProviderTimeoutError`, `ProviderConnectionError`
-- Message patterns: connection, timeout, deadlock, rate limit, unavailable, etc.
-- Non-transient provider/auth/validation errors fail fast
+- SQLAlchemy `IntegrityError`, `DataError`, and `ProgrammingError` are **never** transient (even when bound parameters contain words like "timeout")
+- Other DB/driver errors: message patterns on the underlying driver/original exception only
+- Generic `ProviderError` and `ProviderAuthError` fail fast (message substrings are not used)
+- Ollama/Voyage map HTTP `408`, `429`, `502`, `503`, `504` to the structured transient types above (`500` is not retried)
 
-**HTTP status codes** (SDK clients and documentation): `408`, `429`, `502`, `503`, `504`
+**HTTP status codes** (SDK clients and documentation): `408`, `429`, `502`, `503`, `504` (not `500`)
 
 ### Where retries apply
 
 | Surface | Retries? | Notes |
 | --- | --- | --- |
-| DB factory (`db/__init__.py`) | Yes | Most ops use shared defaults; some status updates use `base_delay=0.5` |
-| Embedding service | Yes | Wraps provider `embed()` |
+| DB factory (`db/__init__.py`) | Yes | Most ops; non-idempotent writes use `retry_on_timeout=False` |
+| DB writes (`create_document`, chunk storage, atomic upload) | Connection/transient only | No retry after ambiguous client timeout |
+| Session reads/deletes/bindings | Yes | `list_session_records`, `get_session_record`, etc. |
+| `store_chat_message` / `create_session_record` | No | Not idempotent under timeout retry |
+| `list_applied_migrations` | No | Startup has its own bounded retry loop |
+| Embedding service | Yes | Wraps provider `embed()`; OpenAI/Anthropic SDK retries disabled (`max_retries=0`) |
 | LLM answer generation (non-streaming) | Yes | Wraps provider `generate()`; streaming is not retried |
 | LLM streaming | No | Bytes may have started — explicit non-goal |
+| Query transformation | No | Soft-fails without backend retry |
 | HTTP middleware (`POST /chat`, upload) | No | Explicit non-goal |
+| Ingestion queue job failures | Selective | Retries only when `is_transient_error()`; auth/parse/programming errors → DLQ |
 | Python/TS SDK `GET`/`HEAD` | Yes | Safe, idempotent reads |
 | Python/TS SDK mutating methods | No | Upload, chat, sessions, streaming |
 

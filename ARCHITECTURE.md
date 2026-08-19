@@ -267,31 +267,35 @@ for legal, academic, and internal knowledge base use cases.
 
 ## Retry Logic & Resilience
 
-All external I/O is wrapped with retry logic via `backend/utils/retry.py`.
+Selected backend I/O paths use shared retry logic via `backend/utils/retry.py`.
 See [DEVELOPMENT.md — Retry behavior](DEVELOPMENT.md#retry-behavior) for the
 full cross-surface contract and audit checklist.
 
 **`retry_async` features:**
-- Per-attempt timeout via `asyncio.wait_for` (default 30s)
+- Per-attempt timeout via `asyncio.wait_for` (DB: `SQLALCHEMY_STATEMENT_TIMEOUT_SEC + 5`)
+- `retry_on_timeout=False` on non-idempotent DB writes
 - Exponential backoff with full jitter — `random.uniform(0, cap)` prevents thundering herd
-- `asyncio.TimeoutError` caught by type and always treated as transient
-- Provider rate limits, timeouts, and connection errors detected by exception type
-- Non-transient errors (4xx validation failures) fail fast without retry
+- `asyncio.TimeoutError` retried by default except when `retry_on_timeout=False`
+- Provider rate limits, timeouts, and connection errors detected by structured exception types
+- Non-transient errors (4xx validation failures, generic `ProviderError`) fail fast without retry
 - `max_retries` means retries *after* the first attempt — `max_retries=3` makes 4 total attempts
+- OpenAI/Anthropic SDK internal retries disabled (`max_retries=0`); backend owns retry policy
 
 **Where retries apply:**
-- DB factory operations and embedding calls use shared defaults (`DEFAULT_MAX_RETRIES=3`)
-- Non-streaming LLM answer generation retries transient provider failures
+- DB factory operations (with per-operation exceptions documented in DEVELOPMENT.md)
+- Embedding and non-streaming LLM answer generation use shared defaults (`DEFAULT_MAX_RETRIES=3`)
 - Streaming LLM responses are not retried after bytes may have started
+- Ingestion queue retries only transient failures; capacity-safe requeue (DLQ when full)
 
 **Timeout configuration:**
 | Surface | Timeout | Mechanism |
 | --- | --- | --- |
-| DB operations | 10s per attempt | `retry_async(timeout=10.0)` |
-| Embedding calls | 30s per attempt | `retry_async(timeout=30.0)` |
-| LLM HTTP client | 60s | `HttpOptions(timeout=LLM_HTTP_TIMEOUT_MS)` |
+| DB operations (outer) | `SQLALCHEMY_STATEMENT_TIMEOUT_SEC + 5` | `retry_async` + `asyncio.wait_for` |
+| DB operations (asyncpg) | `SQLALCHEMY_STATEMENT_TIMEOUT_SEC` | asyncpg client `command_timeout` (not server `statement_timeout`) |
+| Embedding calls | `EMBEDDING_HTTP_TIMEOUT_SEC` | provider HTTP client + outer `retry_async` |
+| LLM HTTP client | `LLM_HTTP_TIMEOUT_MS` | SDK/`HttpOptions` timeout (ms) |
+| Redis clients | `REDIS_SOCKET_TIMEOUT_SEC` (default 5s) | `socket_timeout` + `socket_connect_timeout` |
 | SQLAlchemy pool | 30s checkout | `pool_timeout` on engine |
-| SQLAlchemy queries | 30s | `command_timeout` on asyncpg |
 | Health checks | 10s (embed), 15s (LLM) | `asyncio.wait_for` |
 
 ---

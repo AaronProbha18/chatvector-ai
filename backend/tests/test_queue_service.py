@@ -206,7 +206,7 @@ async def test_job_in_dlq_has_correct_attempt_count(monkeypatch):
     mock_pipeline_cls = MagicMock()
     mock_pipeline_inst = mock_pipeline_cls.return_value
     mock_pipeline_inst.process_document_background = AsyncMock(
-        side_effect=RuntimeError("always fails")
+        side_effect=RuntimeError("service unavailable")
     )
 
     with (
@@ -278,7 +278,7 @@ async def test_retryable_failure_sleeps_before_requeue(monkeypatch):
     mock_pipeline_cls = MagicMock()
     mock_pipeline_inst = mock_pipeline_cls.return_value
     mock_pipeline_inst.process_document_background = AsyncMock(
-        side_effect=[RuntimeError("transient failure"), None]
+        side_effect=[RuntimeError("service unavailable"), None]
     )
 
     sleep_mock = AsyncMock()
@@ -299,6 +299,82 @@ async def test_retryable_failure_sleeps_before_requeue(monkeypatch):
     delay = sleep_mock.await_args.args[0]
     assert 0.0 <= delay <= 20.0
     assert len(service.dlq_jobs()) == 0
+
+
+@pytest.mark.asyncio
+async def test_auth_error_goes_to_dlq_without_retry(monkeypatch):
+    """ProviderAuthError is non-retryable and should not consume retry budget."""
+    monkeypatch.setattr("services.queue_asyncio.config.QUEUE_JOB_MAX_RETRIES", 5)
+
+    from services.providers.base import ProviderAuthError
+
+    service = AsyncioIngestionQueue()
+    service._rate_limiter.acquire = AsyncMock()
+
+    mock_pipeline_cls = MagicMock()
+    mock_pipeline_inst = mock_pipeline_cls.return_value
+    mock_pipeline_inst.process_document_background = AsyncMock(
+        side_effect=ProviderAuthError("invalid API key")
+    )
+
+    with (
+        patch("services.ingestion_pipeline.IngestionPipeline", mock_pipeline_cls),
+        patch("services.queue_asyncio.db.update_document_status", new=AsyncMock()),
+        patch("services.queue_asyncio.asyncio.sleep", new=AsyncMock()) as sleep_mock,
+    ):
+        await service.start()
+        try:
+            await service.enqueue(_make_job("doc-auth-fail"))
+            await _drain(service)
+        finally:
+            await service.stop()
+
+    assert mock_pipeline_inst.process_document_background.await_count == 1
+    sleep_mock.assert_not_called()
+    assert len(service.dlq_jobs()) == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_requeue_on_full_queue_moves_to_dlq_without_hanging(monkeypatch):
+    """Workers must not block on queue.put() when the queue is full during retry."""
+    monkeypatch.setattr("services.queue_asyncio.config.QUEUE_MAX_SIZE", 1)
+    monkeypatch.setattr("services.queue_asyncio.config.QUEUE_WORKER_COUNT", 1)
+    monkeypatch.setattr("services.queue_asyncio.config.QUEUE_JOB_MAX_RETRIES", 2)
+    monkeypatch.setattr("services.queue_asyncio.config.QUEUE_RETRY_BASE_DELAY", 0.01)
+
+    service = AsyncioIngestionQueue()
+    service._rate_limiter.acquire = AsyncMock()
+
+    call_count = 0
+
+    async def fail_and_fill_queue(**kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            service._queue.put_nowait(_make_job("blocker"))
+            raise RuntimeError("transient unavailable")
+        return None
+
+    mock_pipeline_cls = MagicMock()
+    mock_pipeline_inst = mock_pipeline_cls.return_value
+    mock_pipeline_inst.process_document_background = AsyncMock(
+        side_effect=fail_and_fill_queue
+    )
+
+    with (
+        patch("services.ingestion_pipeline.IngestionPipeline", mock_pipeline_cls),
+        patch("services.queue_asyncio.db.update_document_status", new=AsyncMock()),
+        patch("services.queue_asyncio.asyncio.sleep", new=AsyncMock()),
+    ):
+        await service.start()
+        try:
+            await service.enqueue(_make_job("doc-a"))
+            await asyncio.wait_for(service._queue.join(), timeout=3.0)
+        finally:
+            await service.stop()
+
+    assert len(service.dlq_jobs()) >= 1
+    assert any(entry.doc_id == "doc-a" for entry in service.dlq_jobs())
 
 
 # ---------------------------------------------------------------------------

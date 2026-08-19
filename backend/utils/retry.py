@@ -26,7 +26,6 @@ logger = logging.getLogger(__name__)
 DEFAULT_MAX_RETRIES = 3
 DEFAULT_BASE_DELAY = 1.0
 DEFAULT_BACKOFF = 2.0
-DEFAULT_DB_TIMEOUT_SEC = 10.0
 
 # HTTP status codes treated as transient when calling external APIs or in SDK clients.
 RETRYABLE_HTTP_STATUS_CODES = frozenset({408, 429, 502, 503, 504})
@@ -47,14 +46,21 @@ TRANSIENT_DB_ERROR_PATTERNS = [
 ]
 
 
+def get_default_db_timeout_sec() -> float:
+    """Outer per-attempt DB deadline; must exceed asyncpg ``command_timeout``."""
+    from core.config import config
+
+    return float(config.SQLALCHEMY_STATEMENT_TIMEOUT_SEC) + 5.0
+
+
 def is_transient_error(exception: Exception) -> bool:
     if isinstance(exception, asyncio.TimeoutError):
         return True
 
-    # Provider-layer transient errors (rate limits, timeouts) are always retryable
-    # regardless of which provider is active.
     from services.providers.base import (
+        ProviderAuthError,
         ProviderConnectionError,
+        ProviderError,
         ProviderRateLimitError,
         ProviderTimeoutError,
     )
@@ -65,12 +71,34 @@ def is_transient_error(exception: Exception) -> bool:
     ):
         return True
 
-    error_str = str(exception).lower()
-    logger.debug(f"Checking if error is transient: {error_str}")
+    if isinstance(exception, (ProviderAuthError, ProviderError)):
+        return False
+
+    from sqlalchemy.exc import DataError, IntegrityError, ProgrammingError
+
+    if isinstance(exception, (IntegrityError, DataError, ProgrammingError)):
+        return False
+
+    from sqlalchemy.exc import DBAPIError, StatementError
+
+    if isinstance(exception, StatementError):
+        orig = exception.orig
+        if isinstance(orig, (IntegrityError, DataError, ProgrammingError)):
+            return False
+        error_str = str(orig if orig is not None else exception).lower()
+    elif isinstance(exception, DBAPIError):
+        orig = exception.orig
+        if isinstance(orig, (IntegrityError, DataError, ProgrammingError)):
+            return False
+        error_str = str(orig if orig is not None else exception).lower()
+    else:
+        error_str = str(exception).lower()
+
+    logger.debug("Checking if error is transient: %s", error_str)
 
     for pattern in TRANSIENT_DB_ERROR_PATTERNS:
         if pattern in error_str:
-            logger.debug(f"Error matched transient pattern: {pattern}")
+            logger.debug("Error matched transient pattern: %s", pattern)
             return True
 
     return False
@@ -84,6 +112,7 @@ async def retry_async(
     timeout: float | None = 30.0,
     retryable_exceptions: Tuple[Type[Exception], ...] = (Exception,),
     func_name: Optional[str] = None,
+    retry_on_timeout: bool = True,
 ) -> Any:
     if func_name is None:
         func_name = getattr(func, '__name__', 'unknown_function')
@@ -99,7 +128,7 @@ async def retry_async(
                 return await func()
         except asyncio.TimeoutError as e:
             last_exception = e
-            if attempt == max_attempts - 1:
+            if not retry_on_timeout or attempt == max_attempts - 1:
                 logger.error(
                     f"Final attempt timed out for {func_name}",
                     extra={
@@ -125,6 +154,8 @@ async def retry_async(
             )
             await asyncio.sleep(delay)
             continue
+        except asyncio.CancelledError:
+            raise
         except retryable_exceptions as e:
             last_exception = e
 

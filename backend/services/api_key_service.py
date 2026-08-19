@@ -27,7 +27,7 @@ from typing import Literal, Optional, Union
 
 from sqlalchemy import select
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import sessionmaker
 
 from core.models import ApiKey, Tenant
@@ -44,25 +44,15 @@ _KEY_SECRET_LEN = 32    # URL-safe base64 chars
 
 ValidateApiKeyResult = Union[tuple[str, str], Literal["revoked", "expired"]]
 
-
-def _make_session_factory() -> sessionmaker:
-    db_url = os.getenv(
-        "DATABASE_URL",
-        "postgresql://postgres:postgres@localhost:5432/postgres",
-    )
-    async_url = db_url.replace("postgresql://", "postgresql+asyncpg://")
-    engine = create_async_engine(async_url, echo=False, pool_size=2, max_overflow=4)
-    return sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-
-
-# Lazy singleton — created on first use so tests can set DATABASE_URL before import.
 _session_factory: Optional[sessionmaker] = None
 
 
 def _get_session_factory() -> sessionmaker:
     global _session_factory
     if _session_factory is None:
-        _session_factory = _make_session_factory()
+        from db import get_db_service
+
+        _session_factory = get_db_service().async_session
     return _session_factory
 
 

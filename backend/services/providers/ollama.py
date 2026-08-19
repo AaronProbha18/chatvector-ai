@@ -36,11 +36,15 @@ _DEFAULT_LLM_MODEL = "llama3"
 
 def _classify_http_error(exc: httpx.HTTPStatusError) -> ProviderError:
     """Map an HTTP status error from the Ollama REST API to a provider exception."""
+    from utils.retry import RETRYABLE_HTTP_STATUS_CODES
+
     code = exc.response.status_code
     if code == 429:
         return ProviderRateLimitError(str(exc))
     if code in (401, 403):
         return ProviderAuthError(str(exc))
+    if code in RETRYABLE_HTTP_STATUS_CODES:
+        return ProviderConnectionError(str(exc))
     return ProviderError(str(exc))
 
 

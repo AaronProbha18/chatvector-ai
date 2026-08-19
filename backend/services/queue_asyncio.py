@@ -26,6 +26,7 @@ from services.queue_base import (
     QueueFull,
     QueueJob,
     TokenBucketRateLimiter,
+    is_retryable_ingestion_failure,
 )
 
 logger = logging.getLogger(__name__)
@@ -240,6 +241,22 @@ class AsyncioIngestionQueue(BaseIngestionQueue):
                 ))
                 return
 
+            if not is_retryable_ingestion_failure(exc):
+                logger.error(
+                    f"Document {job.doc_id} ({job.file_name!r}) failed with "
+                    f"non-retryable error — moving to DLQ: {exc}",
+                    exc_info=True,
+                )
+                self._dlq.append(DLQEntry(
+                    doc_id=job.doc_id,
+                    file_name=job.file_name,
+                    content_type=job.content_type,
+                    attempt=job.attempt,
+                    error=str(exc),
+                    tenant_id=job.tenant_id,
+                ))
+                return
+
             if job.attempt < config.QUEUE_JOB_MAX_RETRIES:
                 job.attempt += 1
                 cap = config.QUEUE_RETRY_BASE_DELAY * (2 ** job.attempt)
@@ -250,7 +267,7 @@ class AsyncioIngestionQueue(BaseIngestionQueue):
                 )
                 try:
                     await db.update_document_status(
-                        doc_id=job.doc_id, 
+                        doc_id=job.doc_id,
                         status="retrying",
                         tenant_id=job.tenant_id,
                     )
@@ -259,8 +276,41 @@ class AsyncioIngestionQueue(BaseIngestionQueue):
                         f"Failed to set retrying status for {job.doc_id}: {status_err}"
                     )
                 await asyncio.sleep(delay)
+                try:
+                    self._queue.put_nowait(job)
+                except asyncio.QueueFull:
+                    error_msg = (
+                        f"Ingestion queue is at capacity ({config.QUEUE_MAX_SIZE})"
+                    )
+                    logger.error(
+                        "Document %s retry could not be requeued — %s",
+                        job.doc_id,
+                        error_msg,
+                    )
+                    try:
+                        await db.update_document_status(
+                            doc_id=job.doc_id,
+                            status="failed",
+                            tenant_id=job.tenant_id,
+                            error={
+                                "stage": "queued",
+                                "message": error_msg,
+                            },
+                        )
+                    except Exception as status_err:
+                        logger.error(
+                            f"Failed to set failed status for {job.doc_id}: {status_err}"
+                        )
+                    self._dlq.append(DLQEntry(
+                        doc_id=job.doc_id,
+                        file_name=job.file_name,
+                        content_type=job.content_type,
+                        attempt=job.attempt,
+                        error=error_msg,
+                        tenant_id=job.tenant_id,
+                    ))
+                    return
                 self._pending_doc_ids.append(job.doc_id)
-                await self._queue.put(job)
             else:
                 logger.error(
                     f"Document {job.doc_id} ({job.file_name!r}) exhausted "

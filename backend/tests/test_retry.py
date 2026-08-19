@@ -176,3 +176,109 @@ def test_is_transient_error_generic_provider_error_non_transient():
     from services.providers.base import ProviderError
 
     assert is_transient_error(ProviderError("Malformed request")) is False
+
+
+def test_is_transient_error_provider_error_connection_substring_not_transient():
+    from services.providers.base import ProviderError
+
+    assert is_transient_error(ProviderError("bad connection_id in payload")) is False
+
+
+def test_is_transient_error_integrity_error_with_timeout_in_params_not_transient():
+    from sqlalchemy.exc import IntegrityError, StatementError
+
+    orig = IntegrityError("statement", {}, Exception("duplicate key"))
+    exc = StatementError(
+        "duplicate key",
+        "INSERT INTO document_chunks ...",
+        {"chunk_text": "discuss timeout handling in detail"},
+        orig,
+    )
+    assert is_transient_error(exc) is False
+
+
+def test_ollama_classifies_502_as_transient_connection():
+    import httpx
+    from services.providers.base import ProviderConnectionError
+    from services.providers.ollama import _classify_http_error
+
+    request = httpx.Request("POST", "http://localhost:11434/api/embeddings")
+    response = httpx.Response(502, request=request)
+    exc = httpx.HTTPStatusError("bad gateway", request=request, response=response)
+    assert isinstance(_classify_http_error(exc), ProviderConnectionError)
+
+
+def test_ollama_classifies_500_as_non_transient_provider_error():
+    import httpx
+    from services.providers.base import ProviderConnectionError, ProviderError
+    from services.providers.ollama import _classify_http_error
+
+    request = httpx.Request("POST", "http://localhost:11434/api/embeddings")
+    response = httpx.Response(500, request=request)
+    exc = httpx.HTTPStatusError("internal error", request=request, response=response)
+    assert isinstance(_classify_http_error(exc), ProviderError)
+    assert not isinstance(_classify_http_error(exc), ProviderConnectionError)
+
+
+@pytest.mark.asyncio
+async def test_retry_on_timeout_false_executes_once():
+    mock_func = AsyncMock()
+
+    async def always_timeout(coro, timeout=None):
+        coro.close()
+        raise asyncio.TimeoutError()
+
+    with patch("utils.retry.asyncio.wait_for", side_effect=always_timeout):
+        with pytest.raises(asyncio.TimeoutError):
+            await retry_async(
+                mock_func,
+                max_retries=3,
+                timeout=1.0,
+                retry_on_timeout=False,
+            )
+
+    assert mock_func.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_cancelled_error_propagates_without_retry():
+    mock_func = AsyncMock(side_effect=asyncio.CancelledError())
+
+    with pytest.raises(asyncio.CancelledError):
+        await retry_async(mock_func, max_retries=3, timeout=None)
+
+    assert mock_func.call_count == 1
+
+
+@pytest.mark.asyncio
+async def test_retry_async_retries_transient_provider_error():
+    from services.providers.base import ProviderConnectionError
+
+    mock_func = AsyncMock(
+        side_effect=[ProviderConnectionError("502 bad gateway"), "ok"]
+    )
+
+    with patch("utils.retry.asyncio.sleep", new_callable=AsyncMock):
+        result = await retry_async(mock_func, max_retries=1, timeout=None)
+
+    assert result == "ok"
+    assert mock_func.call_count == 2
+
+
+@pytest.mark.asyncio
+async def test_retry_async_auth_error_fails_fast():
+    from services.providers.base import ProviderAuthError
+
+    mock_func = AsyncMock(side_effect=ProviderAuthError("invalid key"))
+
+    with pytest.raises(ProviderAuthError):
+        await retry_async(mock_func, max_retries=3, timeout=None)
+
+    assert mock_func.call_count == 1
+
+
+def test_get_default_db_timeout_exceeds_statement_timeout():
+    from core.config import config
+    from utils.retry import get_default_db_timeout_sec
+
+    assert get_default_db_timeout_sec() > config.SQLALCHEMY_STATEMENT_TIMEOUT_SEC

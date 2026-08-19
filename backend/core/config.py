@@ -26,7 +26,15 @@ else:
     )
 
 # Statuses that indicate a document was mid-flight when the server last stopped.
-STALE_INGESTION_STATUSES = ["queued", "retrying", "extracting", "chunking", "embedding", "storing"]
+STALE_INGESTION_STATUSES = [
+    "uploaded",
+    "queued",
+    "retrying",
+    "extracting",
+    "chunking",
+    "embedding",
+    "storing",
+]
 VALID_CHUNKING_STRATEGIES = {"fixed", "paragraph", "semantic"}
 VALID_QUERY_TRANSFORMATION_STRATEGIES = {"rewrite", "expand", "stepback"}
 VALID_LLM_PROVIDERS = set(LLM_PROVIDER_NAMES)
@@ -163,6 +171,9 @@ class Settings:
 
     # Queue backend selection
     REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+    REDIS_SOCKET_TIMEOUT_SEC: float = max(
+        0.1, float(os.getenv("REDIS_SOCKET_TIMEOUT_SEC", "5"))
+    )
     QUEUE_BACKEND: str = os.getenv(
         "QUEUE_BACKEND", 
         "redis" if APP_ENV.lower() == "production" else "memory"
@@ -284,3 +295,13 @@ def get_embedding_dim() -> int:
     from services.providers import get_embedding_provider
 
     return get_embedding_provider().embedding_dim
+
+
+def redis_connection_kwargs(**extra) -> dict:
+    """Keyword args for redis-py ``Redis.from_url`` with bounded socket waits."""
+    timeout = config.REDIS_SOCKET_TIMEOUT_SEC
+    return {
+        "socket_timeout": timeout,
+        "socket_connect_timeout": timeout,
+        **extra,
+    }
