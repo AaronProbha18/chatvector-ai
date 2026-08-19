@@ -235,8 +235,30 @@ The system prompt and LLM parameters are externalized for operator
 customization without code changes.
 
 - `SYSTEM_PROMPT_PATH` — path to system prompt file (default: `backend/prompts/default_system.txt`)
+- `PROMPT_PERSONA` — response style preset (default: `default`)
 - `LLM_TEMPERATURE` — generation temperature (default: 0.2)
 - `LLM_MAX_OUTPUT_TOKENS` — max output tokens (default: 1024)
+
+### Response personas
+
+`PROMPT_PERSONA` selects a server-side system prompt style for answer
+generation. Supported values:
+
+- `default` — concise RAG assistant (`backend/prompts/default_system.txt`)
+- `concise` — extreme brevity, bullet lists
+- `conversational` — warm, approachable tone
+- `academic` — formal, scholarly synthesis
+- `technical` — engineering-focused, code-aware
+
+When `PROMPT_PERSONA=default`, the canonical prompt is
+`backend/prompts/default_system.txt`. Other personas load from
+`backend/prompts/personas/{persona}.txt`.
+
+`SYSTEM_PROMPT_PATH`, when set, takes precedence over `PROMPT_PERSONA`
+and loads a custom prompt file directly.
+
+Invalid `PROMPT_PERSONA` values log a warning at startup and fall back
+to `default`.
 
 Example domain prompts are provided under `backend/prompts/examples/`
 for legal, academic, and internal knowledge base use cases.
