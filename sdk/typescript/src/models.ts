@@ -87,6 +87,7 @@ export type ChatResponse = {
   latencyMs: number;
   model: string;
   status: "ok" | "error";
+  sessionId?: string | null;
   error?: { code: string; message: string };
   _raw?: Record<string, unknown>;
 };
@@ -101,6 +102,7 @@ export type BatchChatResult = {
   error?: { code: string; message: string };
   latencyMs: number;
   model: string;
+  sessionId?: string | null;
   _raw?: Record<string, unknown>;
 };
 

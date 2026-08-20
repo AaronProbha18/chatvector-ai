@@ -652,7 +652,7 @@ mutating HTTP requests.
 | DB factory (`db/__init__.py`) | Yes | Most ops; non-idempotent writes use `retry_on_timeout=False` |
 | DB writes (`create_document`, chunk storage, atomic upload) | Connection/transient only | No retry after ambiguous client timeout |
 | Session reads/deletes/bindings | Yes | `list_session_records`, `get_session_record`, etc. |
-| `store_chat_message` / `create_session_record` | No | Not idempotent under timeout retry |
+| `store_chat_message` / `store_chat_turn` / `create_session_record` | No | Not idempotent under timeout retry |
 | `list_applied_migrations` | No | Startup has its own bounded retry loop |
 | Embedding service | Yes | Wraps provider `embed()`; OpenAI/Anthropic SDK retries disabled (`max_retries=0`) |
 | LLM answer generation (non-streaming) | Yes | Wraps provider `generate()`; streaming is not retried |
@@ -662,6 +662,16 @@ mutating HTTP requests.
 | Ingestion queue job failures | Selective | Retries only when `is_transient_error()`; auth/parse/programming errors → DLQ |
 | Python/TS SDK `GET`/`HEAD` | Yes | Safe, idempotent reads |
 | Python/TS SDK mutating methods | No | Upload, chat, sessions, streaming |
+
+**Batch LLM concurrency:** `CHAT_BATCH_LLM_CONCURRENCY` (default `4`) limits the maximum
+concurrent batch `transform_query` and `generate_answer` LLM work **per API process**
+(module-level shared semaphore). Two simultaneous `POST /chat/batch` requests in the
+same process still share that cap — e.g. with value `4`, at most four transform/answer
+operations run concurrently across all in-flight batch work in that process.
+It does not apply to shared embedding, retrieval, or non-batch chat paths.
+
+**Single-document batch items** are compare-style: session history is not injected and
+successful turns are not persisted, even when `session_id` is set.
 
 ### Audit checklist
 

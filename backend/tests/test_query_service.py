@@ -184,13 +184,13 @@ def test_unknown_strategy_logs_warning_and_returns_original(caplog, monkeypatch)
 # ---------------------------------------------------------------------------
 
 _SAMPLE_HISTORY = [
-    {"role": "assistant", "content": "Option A is fast; Option B is cheap."},
     {"role": "user", "content": "What are the options?"},
+    {"role": "assistant", "content": "Option A is fast; Option B is cheap."},
 ]
 
 
 def test_format_history_context_chronological_order():
-    """History (DESC from DB) must be reversed to chronological order in the prompt."""
+    """History arrives oldest-first and is rendered in that order."""
     result = _format_history_context(_SAMPLE_HISTORY)
     lines = result.splitlines()
     assert lines[0].startswith("User:")

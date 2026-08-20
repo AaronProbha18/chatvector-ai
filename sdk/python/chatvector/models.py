@@ -144,6 +144,7 @@ class ChatResponse:
     sources: list[ChatSource] = field(default_factory=list)
     latency_ms: int = 0
     model: str = ""
+    session_id: str | None = None
     raw: JSONDict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -159,12 +160,13 @@ class ChatResponse:
             sources=sources,
             latency_ms=int(payload.get("latency_ms") or 0),
             model=str(payload.get("model") or ""),
+            session_id=_optional_str(payload.get("session_id")),
             raw=raw,
         )
 
     def to_dict(self) -> JSONDict:
         """Convert the model back to a JSON-serializable dictionary."""
-        return {
+        payload = {
             "question": self.question,
             "chunks": self.chunks,
             "answer": self.answer,
@@ -172,6 +174,9 @@ class ChatResponse:
             "latency_ms": self.latency_ms,
             "model": self.model,
         }
+        if self.session_id is not None:
+            payload["session_id"] = self.session_id
+        return payload
 
 
 @dataclass(slots=True)
@@ -328,6 +333,7 @@ class BatchChatResult:
     error: JSONDict | None = None
     latency_ms: int = 0
     model: str = ""
+    session_id: str | None = None
     raw: JSONDict = field(default_factory=dict, repr=False)
 
     @classmethod
@@ -345,6 +351,7 @@ class BatchChatResult:
             error=dict(error) if isinstance(error, Mapping) else None,
             latency_ms=int(payload.get("latency_ms") or 0),
             model=str(payload.get("model") or ""),
+            session_id=_optional_str(payload.get("session_id")),
             raw=raw,
         )
 
@@ -358,6 +365,8 @@ class BatchChatResult:
             "latency_ms": self.latency_ms,
             "model": self.model,
         }
+        if self.session_id is not None:
+            payload["session_id"] = self.session_id
         if self.answer is not None:
             payload["answer"] = self.answer
         if self.sources:

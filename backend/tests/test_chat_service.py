@@ -141,7 +141,7 @@ async def test_answer_question_for_document_passes_session_id():
         "services.chat_service.generate_answer",
         new=AsyncMock(return_value=("final answer", 0, "test-model")),
     ), patch("db.get_session_history", new=AsyncMock(return_value=[])) as mock_history, patch(
-        "db.store_chat_message", new=AsyncMock()
+        "db.store_chat_turn", new=AsyncMock()
     ):
         await answer_question_for_document(
                 question="Q",
@@ -535,7 +535,7 @@ async def test_stream_history_loaded_and_bounded_before_transform():
         patch("services.chat_service.build_context_from_chunks", return_value="ctx"),
         patch("services.chat_service.generate_answer_stream", new=mock_stream),
         patch("db.get_session_history", new=AsyncMock(return_value=full_history)),
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
     ):
         async for _ in answer_question_stream_for_document(
             "follow-up?", "doc-1", match_count=5,
@@ -543,7 +543,7 @@ async def test_stream_history_loaded_and_bounded_before_transform():
         ):
             pass
 
-    assert captured["history"] == full_history[:window]
+    assert captured["history"] == full_history[-window:]
 
 
 @pytest.mark.asyncio
@@ -566,7 +566,7 @@ async def test_answer_question_stream_for_document_error():
         patch("services.chat_service._retrieve_chunks_for_documents", new=AsyncMock(return_value=[])),
         patch("services.chat_service.build_context_from_chunks", return_value="context"),
         patch("services.chat_service.generate_answer_stream", new=mock_generate_stream),
-        patch("db.store_chat_message", new=AsyncMock()) as mock_store,
+        patch("db.store_chat_turn", new=AsyncMock()) as mock_store,
     ):
         chunks = []
         async for chunk in answer_question_stream_for_document(
@@ -626,7 +626,7 @@ async def test_stream_complete_event_includes_sources_and_session_id():
         patch("services.chat_service.generate_answer_stream", new=mock_generate_stream),
         patch("services.providers.get_llm_provider", return_value=mock_provider),
         patch("db.get_session_history", new=AsyncMock(return_value=[])),
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
     ):
         events = []
         async for event in answer_question_stream_for_document(
@@ -695,7 +695,7 @@ async def test_stream_cancellation_does_not_persist():
         patch("services.chat_service._retrieve_chunks_for_documents", new=AsyncMock(return_value=[])),
         patch("services.chat_service.build_context_from_chunks", return_value="context"),
         patch("services.chat_service.generate_answer_stream", new=blocking_stream),
-        patch("db.store_chat_message", new=AsyncMock()) as mock_store,
+        patch("db.store_chat_turn", new=AsyncMock()) as mock_store,
     ):
         gen = answer_question_stream_for_document(
             "Q?", "doc-1", session_id="sess-cancel", auth=TEST_AUTH
@@ -890,7 +890,7 @@ async def test_history_loaded_before_transform_query_for_single_chat():
         patch("services.chat_service.build_context_from_chunks", return_value="ctx"),
         patch("services.chat_service.generate_answer", new=AsyncMock(return_value=("ans", 0, "m"))),
         patch("db.get_session_history", new=AsyncMock(return_value=full_history)),
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
         patch("services.chat_service.transform_query", new=fake_transform),
     ):
         await answer_question_for_document(
@@ -923,7 +923,7 @@ async def test_history_bounded_to_window_for_single_chat():
         patch("services.chat_service.build_context_from_chunks", return_value="ctx"),
         patch("services.chat_service.generate_answer", new=AsyncMock(return_value=("ans", 0, "m"))),
         patch("db.get_session_history", new=AsyncMock(return_value=full_history)),
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
         patch("services.chat_service.transform_query", new=fake_transform),
     ):
         await answer_question_for_document(
@@ -933,7 +933,7 @@ async def test_history_bounded_to_window_for_single_chat():
             auth=TEST_AUTH,
         )
 
-    assert captured["history"] == full_history[:window]
+    assert captured["history"] == full_history[-window:]
 
 
 @pytest.mark.asyncio
@@ -970,7 +970,7 @@ async def test_history_session_isolation_single_chat():
         patch("services.chat_service.build_context_from_chunks", return_value="ctx"),
         patch("services.chat_service.generate_answer", new=AsyncMock(return_value=("ans", 0, "m"))),
         patch("db.get_session_history", new=AsyncMock(return_value=[])) as mock_hist,
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
     ):
         await answer_question_for_document(
             question="Q",
@@ -993,7 +993,7 @@ async def test_history_tenant_isolation_single_chat():
         patch("services.chat_service.build_context_from_chunks", return_value="ctx"),
         patch("services.chat_service.generate_answer", new=AsyncMock(return_value=("ans", 0, "m"))),
         patch("db.get_session_history", new=AsyncMock(return_value=[])) as mock_hist,
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
     ):
         await answer_question_for_document(
             question="Q",
@@ -1025,7 +1025,7 @@ async def test_batch_history_bounded_to_window():
         patch("services.chat_service.build_context_from_chunks", return_value="ctx"),
         patch("services.chat_service.generate_answer", new=AsyncMock(return_value=("ans", 0, "m"))),
         patch("db.get_session_history", new=AsyncMock(return_value=full_history)),
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
         patch("services.chat_service.transform_query", new=fake_transform),
     ):
         await answer_questions_for_documents_batch(
@@ -1074,7 +1074,7 @@ async def test_batch_history_tenant_isolation():
         patch("services.chat_service.build_context_from_chunks", return_value="ctx"),
         patch("services.chat_service.generate_answer", new=AsyncMock(return_value=("ans", 0, "m"))),
         patch("db.get_session_history", new=AsyncMock(return_value=[])) as mock_hist,
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
     ):
         await answer_questions_for_documents_batch(
             [{"question": "Q", "doc_ids": ["doc-a"], "session_id": "sess-t"}],
@@ -1128,7 +1128,7 @@ async def test_compare_batch_ignores_polluted_session_history_in_llm_context():
             new=AsyncMock(side_effect=capture_generate),
         ),
         patch("db.get_session_history", new=AsyncMock(return_value=polluted_history)),
-        patch("db.store_chat_message", new=AsyncMock()) as mock_store,
+        patch("db.store_chat_turn", new=AsyncMock()) as mock_store,
     ):
         await answer_questions_for_documents_batch(
             [
@@ -1180,7 +1180,7 @@ async def test_synthesize_batch_still_injects_session_history_into_llm_context()
             new=AsyncMock(side_effect=capture_generate),
         ),
         patch("db.get_session_history", new=AsyncMock(return_value=history)),
-        patch("db.store_chat_message", new=AsyncMock()) as mock_store,
+        patch("db.store_chat_turn", new=AsyncMock()) as mock_store,
     ):
         await answer_questions_for_documents_batch(
             [
@@ -1197,7 +1197,7 @@ async def test_synthesize_batch_still_injects_session_history_into_llm_context()
     context = captured_contexts[0]
     assert "[Session History]" in context
     assert "Prior synthesized answer." in context
-    assert mock_store.await_count == 2
+    assert mock_store.await_count == 1
 
 
 # ---------------------------------------------------------------------------
@@ -1322,7 +1322,7 @@ async def test_stream_complete_omits_retrieval_debug_by_default():
         patch("services.chat_service.generate_answer_stream", new=mock_generate_stream),
         patch("services.providers.get_llm_provider", return_value=mock_provider),
         patch("db.get_session_history", new=AsyncMock(return_value=[])),
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
     ):
         events = []
         async for event in answer_question_stream_for_document(
@@ -1364,7 +1364,7 @@ async def test_stream_complete_includes_retrieval_debug_when_opted_in():
         patch("services.chat_service.generate_answer_stream", new=mock_generate_stream),
         patch("services.providers.get_llm_provider", return_value=mock_provider),
         patch("db.get_session_history", new=AsyncMock(return_value=[])),
-        patch("db.store_chat_message", new=AsyncMock()),
+        patch("db.store_chat_turn", new=AsyncMock()),
     ):
         events = []
         async for event in answer_question_stream_for_document(
@@ -1498,7 +1498,7 @@ async def test_single_chat_still_uses_session_history_with_polluted_context():
             new=AsyncMock(side_effect=capture_generate),
         ),
         patch("db.get_session_history", new=AsyncMock(return_value=polluted_history)),
-        patch("db.store_chat_message", new=AsyncMock()) as mock_store,
+        patch("db.store_chat_turn", new=AsyncMock()) as mock_store,
     ):
         await answer_question_for_document(
             question="Follow-up question",
@@ -1510,4 +1510,4 @@ async def test_single_chat_still_uses_session_history_with_polluted_context():
     assert len(captured_contexts) == 1
     assert "[Session History]" in captured_contexts[0]
     assert "Earlier handbook answer about PTO." in captured_contexts[0]
-    assert mock_store.await_count == 2
+    assert mock_store.await_count == 1

@@ -66,6 +66,16 @@ _CHAT_WINDOW = 30
 _CHAT_DOC_ID = "00000000-0000-0000-0000-000000000001"
 
 
+def _mock_chat_result(*, question: str, answer: str, doc_id: str = _CHAT_DOC_ID) -> dict:
+    return {
+        "question": question,
+        "doc_id": doc_id,
+        "chunks": 0,
+        "answer": answer,
+        "status": "ok",
+    }
+
+
 def _tenant_auth_from_header(request: Request) -> AuthContext:
     """Test helper: resolve tenant from X-Test-Tenant without API-key parsing."""
     tenant_id = request.headers.get("X-Test-Tenant", "dev")
@@ -121,7 +131,10 @@ def test_post_upload_returns_429_after_limit_exceeded(client):
 def test_post_chat_returns_429_after_limit_exceeded(client):
     payload = {"question": "hello", "doc_id": _CHAT_DOC_ID, "match_count": 5}
     with (
-        patch("routes.chat.answer_question_for_document", new=AsyncMock(return_value={"answer": "ok", "chunks": 0})),
+        patch(
+            "routes.chat.answer_question_for_document",
+            new=AsyncMock(return_value=_mock_chat_result(question="hello", answer="ok")),
+        ),
         patch("routes.chat.db.get_document", new=AsyncMock(return_value={"id": _CHAT_DOC_ID})),
         patch("routes.chat.get_or_create_session", new=AsyncMock(return_value=_FAKE_SESSION)),
         patch("routes.chat.register_session_document", new=AsyncMock()),
@@ -152,7 +165,10 @@ def test_429_response_has_standard_error_shape(client):
 def test_429_includes_retry_after_header(client):
     payload = {"question": "q", "doc_id": _CHAT_DOC_ID, "match_count": 5}
     with (
-        patch("routes.chat.answer_question_for_document", new=AsyncMock(return_value={"answer": "a", "chunks": 0})),
+        patch(
+            "routes.chat.answer_question_for_document",
+            new=AsyncMock(return_value=_mock_chat_result(question="q", answer="a")),
+        ),
         patch("routes.chat.db.get_document", new=AsyncMock(return_value={"id": _CHAT_DOC_ID})),
         patch("routes.chat.get_or_create_session", new=AsyncMock(return_value=_FAKE_SESSION)),
         patch("routes.chat.register_session_document", new=AsyncMock()),
@@ -168,7 +184,10 @@ def test_two_tenants_sharing_ip_have_separate_buckets(multi_tenant_client):
     """Different tenants behind the same client IP do not share rate-limit buckets."""
     payload = {"question": "hello", "doc_id": _CHAT_DOC_ID, "match_count": 5}
     with (
-        patch("routes.chat.answer_question_for_document", new=AsyncMock(return_value={"answer": "ok", "chunks": 0})),
+        patch(
+            "routes.chat.answer_question_for_document",
+            new=AsyncMock(return_value=_mock_chat_result(question="hello", answer="ok")),
+        ),
         patch("routes.chat.db.get_document", new=AsyncMock(return_value={"id": _CHAT_DOC_ID})),
         patch("routes.chat.get_or_create_session", new=AsyncMock(return_value=_FAKE_SESSION)),
         patch("routes.chat.register_session_document", new=AsyncMock()),
@@ -202,7 +221,10 @@ def test_one_tenant_across_ips_shares_one_bucket(multi_tenant_client):
     """One tenant using multiple client IPs remains in a single rate-limit bucket."""
     payload = {"question": "hello", "doc_id": _CHAT_DOC_ID, "match_count": 5}
     with (
-        patch("routes.chat.answer_question_for_document", new=AsyncMock(return_value={"answer": "ok", "chunks": 0})),
+        patch(
+            "routes.chat.answer_question_for_document",
+            new=AsyncMock(return_value=_mock_chat_result(question="hello", answer="ok")),
+        ),
         patch("routes.chat.db.get_document", new=AsyncMock(return_value={"id": _CHAT_DOC_ID})),
         patch("routes.chat.get_or_create_session", new=AsyncMock(return_value=_FAKE_SESSION)),
         patch("routes.chat.register_session_document", new=AsyncMock()),
@@ -239,7 +261,10 @@ def test_endpoint_specific_limits_are_independent(multi_tenant_client):
         patch("routes.upload.db.create_document", new=AsyncMock(return_value="doc-rl")),
         patch("routes.upload.db.update_document_status", new=AsyncMock()),
         patch("routes.upload.ingestion_queue.enqueue", new=AsyncMock(return_value=1)),
-        patch("routes.chat.answer_question_for_document", new=AsyncMock(return_value={"answer": "ok", "chunks": 0})),
+        patch(
+            "routes.chat.answer_question_for_document",
+            new=AsyncMock(return_value=_mock_chat_result(question="hello", answer="ok")),
+        ),
         patch("routes.chat.db.get_document", new=AsyncMock(return_value={"id": _CHAT_DOC_ID})),
         patch("routes.chat.get_or_create_session", new=AsyncMock(return_value=_FAKE_SESSION)),
         patch("routes.chat.register_session_document", new=AsyncMock()),

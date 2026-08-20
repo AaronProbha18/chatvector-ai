@@ -2,7 +2,7 @@ import logging
 import asyncio
 import json
 import time
-from typing import Optional, AsyncGenerator
+from typing import Optional, AsyncGenerator, cast
 
 from core.auth import AuthContext, require_current_tenant
 from core.config import config
@@ -50,6 +50,9 @@ def _structured_error_from_llm_answer(answer: str) -> dict | None:
 
 _retrieval_limit = max(1, int(config.RETRIEVAL_MAX_CONCURRENCY))
 _retrieval_semaphore = asyncio.Semaphore(_retrieval_limit)
+_batch_llm_limit = max(1, int(config.CHAT_BATCH_LLM_CONCURRENCY))
+# Shared per API process; concurrent /chat/batch requests use the same cap.
+_batch_llm_semaphore = asyncio.Semaphore(_batch_llm_limit)
 
 
 def _get_retrieval_semaphore() -> asyncio.Semaphore:
@@ -61,6 +64,17 @@ def _get_retrieval_semaphore() -> asyncio.Semaphore:
         _retrieval_semaphore = asyncio.Semaphore(_retrieval_limit)
 
     return _retrieval_semaphore
+
+
+def _get_batch_llm_semaphore() -> asyncio.Semaphore:
+    global _batch_llm_limit, _batch_llm_semaphore
+
+    configured_limit = max(1, int(config.CHAT_BATCH_LLM_CONCURRENCY))
+    if configured_limit != _batch_llm_limit:
+        _batch_llm_limit = configured_limit
+        _batch_llm_semaphore = asyncio.Semaphore(_batch_llm_limit)
+
+    return _batch_llm_semaphore
 
 
 async def get_embedding(text: str) -> list[float]:
@@ -238,6 +252,120 @@ def _is_compare_style_batch_query(doc_ids: list[str]) -> bool:
     return len(doc_ids) == 1
 
 
+def validate_and_normalize_batch_queries(queries: list[dict]) -> list[dict]:
+    """Validate batch structure using runtime config. Raises ValueError on failure."""
+    if not queries:
+        return []
+
+    if len(queries) > config.CHAT_BATCH_MAX_ITEMS:
+        raise ValueError(
+            f"Batch size {len(queries)} exceeds CHAT_BATCH_MAX_ITEMS={config.CHAT_BATCH_MAX_ITEMS}"
+        )
+
+    normalized_queries: list[dict] = []
+    for index, query in enumerate(queries, start=1):
+        question = (query.get("question") or "").strip()
+        if not question:
+            raise ValueError(f"Query #{index} has empty question")
+
+        doc_ids = _normalize_doc_ids(query.get("doc_ids") or [], query_index=index)
+        if not doc_ids:
+            raise ValueError(f"Query #{index} has no valid document IDs")
+
+        if len(doc_ids) > config.CHAT_MAX_DOC_IDS_PER_QUERY:
+            raise ValueError(
+                f"Query #{index} has {len(doc_ids)} doc IDs; limit is CHAT_MAX_DOC_IDS_PER_QUERY={config.CHAT_MAX_DOC_IDS_PER_QUERY}"
+            )
+
+        match_count = int(query.get("match_count", 5))
+        if match_count < 1:
+            raise ValueError(f"Query #{index} has invalid match_count={match_count}")
+
+        normalized_queries.append(
+            {
+                "question": question,
+                "doc_ids": doc_ids,
+                "match_count": match_count,
+                "session_id": query.get("session_id"),
+                "scope": query.get("scope"),
+            }
+        )
+
+    return normalized_queries
+
+
+def merge_batch_results(
+    slot_results: list[dict | None],
+    service_indices: list[int],
+    service_results: list[dict],
+) -> list[dict]:
+    """Merge per-item setup failures with batch service results in request order."""
+    merged: list[dict | None] = [None] * len(slot_results)
+    for orig_idx, result in zip(service_indices, service_results):
+        merged[orig_idx] = result
+    for index, slot in enumerate(slot_results):
+        if slot is not None:
+            merged[index] = slot
+    return cast(list[dict], merged)
+
+
+async def prepare_batch_chat_items(
+    raw_queries: list[dict],
+    *,
+    tenant_id: str,
+    batch_session_id: str | None,
+) -> tuple[list[tuple[int, dict]], list[dict | None]]:
+    """Validate batch items and perform per-item ownership/session setup.
+
+    Returns ``(service_items, slot_results)`` where ``service_items`` are
+    ``(original_index, normalized_query)`` pairs ready for the batch service,
+    and ``slot_results[i]`` is either ``None`` (proceed) or a structured error.
+    """
+    import db
+    from services.session_service import get_or_create_session, register_session_document
+    from services.tenant_registry import register_tenant_document
+
+    normalized = validate_and_normalize_batch_queries(raw_queries)
+    slot_results: list[dict | None] = [None] * len(normalized)
+    service_items: list[tuple[int, dict]] = []
+
+    for index, query in enumerate(normalized):
+        missing_doc_ids: list[str] = []
+        for doc_id in query["doc_ids"]:
+            doc = await db.get_document(doc_id, tenant_id=tenant_id)
+            if doc is None:
+                missing_doc_ids.append(doc_id)
+
+        if missing_doc_ids:
+            slot_results[index] = {
+                "status": "error",
+                "question": query["question"],
+                "doc_ids": query["doc_ids"],
+                "chunks": 0,
+                "error": {
+                    "code": "document_not_found",
+                    "message": "One or more documents were not found.",
+                },
+                "latency_ms": 0,
+                "model": "",
+                "session_id": query.get("session_id") or batch_session_id,
+            }
+            continue
+
+        session = await get_or_create_session(
+            session_id=query.get("session_id") or batch_session_id,
+            tenant_id=tenant_id,
+        )
+        prepared = dict(query)
+        prepared["session_id"] = session.id
+        for doc_id in query["doc_ids"]:
+            await register_session_document(session.id, doc_id, tenant_id)
+            register_tenant_document(tenant_id, doc_id)
+        service_items.append((index, prepared))
+
+    return service_items, slot_results
+
+
 def _format_sse_event(event: str, data: dict | str) -> str:
     payload = json.dumps(data) if isinstance(data, dict) else data
     return f"event: {event}\ndata: {payload}\n\n"
@@ -312,6 +440,7 @@ async def answer_question_for_document(
             "latency_ms": 0,
             "model": "",
             "status": "error",
+            "session_id": session_id,
             "error": {
                 "code": "no_documents_in_scope",
                 "message": "No documents available for retrieval in the requested scope.",
@@ -331,7 +460,7 @@ async def answer_question_for_document(
             logger.error(f"Failed to load chat history for session {session_id}: {e}", exc_info=True)
 
     transformation_history = (
-        history[: config.QUERY_TRANSFORMATION_HISTORY_WINDOW] if history else None
+        history[-config.QUERY_TRANSFORMATION_HISTORY_WINDOW :] if history else None
     )
     transform_result = await transform_query(question, history=transformation_history)
     transformed_queries = transform_result.queries
@@ -372,6 +501,7 @@ async def answer_question_for_document(
         "sources": _build_sources(matching_chunks),
         "latency_ms": latency_ms,
         "model": model_name,
+        "session_id": session_id,
     }
     llm_err = _structured_error_from_llm_answer(answer)
     if llm_err is not None:
@@ -390,14 +520,14 @@ async def answer_question_for_document(
     if session_id:
         try:
             import db
-            await db.store_chat_message(
-                session_id=session_id, role="user", content=question, tenant_id=tenant_id
-            )
-            await db.store_chat_message(
-                session_id=session_id, role="assistant", content=answer, tenant_id=tenant_id
+            await db.store_chat_turn(
+                session_id=session_id,
+                question=question,
+                answer=answer,
+                tenant_id=tenant_id,
             )
         except Exception as e:
-            logger.error(f"Failed to store chat messages for session {session_id}: {e}", exc_info=True)
+            logger.error(f"Failed to store chat turn for session {session_id}: {e}", exc_info=True)
 
     response = {
         **base,
@@ -456,7 +586,7 @@ async def answer_question_stream_for_document(
                 logger.error(f"Failed to load chat history for session {session_id}: {e}", exc_info=True)
 
         transformation_history = (
-            history[: config.QUERY_TRANSFORMATION_HISTORY_WINDOW] if history else None
+            history[-config.QUERY_TRANSFORMATION_HISTORY_WINDOW :] if history else None
         )
         transform_result = await transform_query(question, history=transformation_history)
         transformed_queries = transform_result.queries
@@ -472,6 +602,7 @@ async def answer_question_stream_for_document(
                 query_embedding=query_embedding,
                 match_count=match_count,
                 tenant_id=tenant_id,
+                session_id=session_id,
                 query_text=question,
             )
             for chunk in chunks:
@@ -518,6 +649,25 @@ async def answer_question_stream_for_document(
 
         model_name = getattr(get_llm_provider(), "model_name", "")
 
+        full_answer = "".join(full_answer_chunks)
+        if not full_answer.strip():
+            full_answer = "No response."
+
+        if session_id:
+            try:
+                import db
+                await db.store_chat_turn(
+                    session_id=session_id,
+                    question=question,
+                    answer=full_answer,
+                    tenant_id=tenant_id,
+                )
+            except Exception as e:
+                logger.error(
+                    f"Failed to store streaming chat turn for session {session_id}: {e}",
+                    exc_info=True,
+                )
+
         yield _format_sse_event(
             "complete",
             _build_stream_complete_payload(
@@ -531,19 +681,6 @@ async def answer_question_stream_for_document(
         # Legacy completion marker — deprecated; retained for backward compatibility.
         yield "event: done\ndata: [DONE]\n\n"
         logger.info(f"Answer stream generated successfully for document {doc_id}")
-
-        if session_id:
-            try:
-                import db
-                full_answer = "".join(full_answer_chunks)
-                await db.store_chat_message(
-                    session_id=session_id, role="user", content=question, tenant_id=tenant_id
-                )
-                await db.store_chat_message(
-                    session_id=session_id, role="assistant", content=full_answer, tenant_id=tenant_id
-                )
-            except Exception as e:
-                logger.error(f"Failed to store streaming chat messages for session {session_id}: {e}", exc_info=True)
 
     except asyncio.CancelledError:
         raise
@@ -576,39 +713,20 @@ async def answer_questions_for_documents_batch(
 
     tenant_id = require_current_tenant(auth)
 
-    if len(queries) > config.CHAT_BATCH_MAX_ITEMS:
-        raise ValueError(
-            f"Batch size {len(queries)} exceeds CHAT_BATCH_MAX_ITEMS={config.CHAT_BATCH_MAX_ITEMS}"
-        )
+    normalized_queries = validate_and_normalize_batch_queries(queries)
+    for query in normalized_queries:
+        if query.get("scope") is None:
+            query["scope"] = scope
 
-    normalized_queries = []
-    for index, query in enumerate(queries, start=1):
-        question = (query.get("question") or "").strip()
-        if not question:
-            raise ValueError(f"Query #{index} has empty question")
+    batch_llm_semaphore = _get_batch_llm_semaphore()
 
-        doc_ids = _normalize_doc_ids(query.get("doc_ids") or [], query_index=index)
-        if not doc_ids:
-            raise ValueError(f"Query #{index} has no valid document IDs")
+    async def _batch_transform(question: str, history: list[dict] | None):
+        async with batch_llm_semaphore:
+            return await transform_query(question, history=history)
 
-        if len(doc_ids) > config.CHAT_MAX_DOC_IDS_PER_QUERY:
-            raise ValueError(
-                f"Query #{index} has {len(doc_ids)} doc IDs; limit is CHAT_MAX_DOC_IDS_PER_QUERY={config.CHAT_MAX_DOC_IDS_PER_QUERY}"
-            )
-
-        match_count = int(query.get("match_count", 5))
-        if match_count < 1:
-            raise ValueError(f"Query #{index} has invalid match_count={match_count}")
-
-        normalized_queries.append(
-            {
-                "question": question,
-                "doc_ids": doc_ids,
-                "match_count": match_count,
-                "session_id": query.get("session_id"),
-                "scope": query.get("scope", scope),
-            }
-        )
+    async def _batch_generate(question: str, context: str):
+        async with batch_llm_semaphore:
+            return await generate_answer(question, context)
 
     # Pre-load session histories so each query's transformation can resolve
     # follow-up references.  One DB round-trip per unique session_id.
@@ -639,10 +757,10 @@ async def answer_questions_for_documents_batch(
 
     transform_results = await asyncio.gather(
         *[
-            transform_query(
+            _batch_transform(
                 q["question"],
                 history=(
-                    h[: config.QUERY_TRANSFORMATION_HISTORY_WINDOW] if h else None
+                    h[-config.QUERY_TRANSFORMATION_HISTORY_WINDOW :] if h else None
                 ),
             )
             for q, h in zip(normalized_queries, per_query_histories)
@@ -650,7 +768,27 @@ async def answer_questions_for_documents_batch(
     )
     transformed_query_lists = [result.queries for result in transform_results]
     flat_queries = [q for queries in transformed_query_lists for q in queries]
-    flat_embeddings = await get_embeddings(flat_queries)
+    try:
+        flat_embeddings = await get_embeddings(flat_queries)
+    except Exception as e:
+        logger.error("Batch embedding call failed: %s", e, exc_info=True)
+        embedding_message = "Failed to generate embeddings for batch request."
+        return [
+            {
+                "status": "error",
+                "question": query["question"],
+                "doc_ids": query["doc_ids"],
+                "chunks": 0,
+                "error": {
+                    "code": "embedding_failed",
+                    "message": embedding_message,
+                },
+                "latency_ms": 0,
+                "model": "",
+                "session_id": query.get("session_id"),
+            }
+            for query in normalized_queries
+        ]
     if len(flat_embeddings) != len(flat_queries):
         mismatch_message = (
             f"Embedding mismatch: got {len(flat_embeddings)} embeddings for {len(flat_queries)} queries"
@@ -735,7 +873,7 @@ async def answer_questions_for_documents_batch(
                 query_session_context.chat_history = preloaded_history
 
             context = build_context_from_chunks(matching_chunks, session_context=query_session_context)
-            answer, latency_ms, model_name = await generate_answer(query["question"], context)
+            answer, latency_ms, model_name = await _batch_generate(query["question"], context)
 
             sources = _build_sources(matching_chunks)
             retrieval_debug = _maybe_retrieval_debug(
@@ -762,14 +900,17 @@ async def answer_questions_for_documents_batch(
             if session_id and not is_compare_style:
                 try:
                     import db
-                    await db.store_chat_message(
-                        session_id=session_id, role="user", content=query["question"], tenant_id=tenant_id
-                    )
-                    await db.store_chat_message(
-                        session_id=session_id, role="assistant", content=answer, tenant_id=tenant_id
+                    await db.store_chat_turn(
+                        session_id=session_id,
+                        question=query["question"],
+                        answer=answer,
+                        tenant_id=tenant_id,
                     )
                 except Exception as e:
-                    logger.error(f"Failed to store batch chat messages for session {session_id}: {e}", exc_info=True)
+                    logger.error(
+                        f"Failed to store batch chat turn for session {session_id}: {e}",
+                        exc_info=True,
+                    )
 
             result_payload = {
                 "status": "ok",

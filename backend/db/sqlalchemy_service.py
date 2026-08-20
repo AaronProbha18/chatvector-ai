@@ -3,6 +3,7 @@ import os
 import asyncio
 import time
 import uuid
+from collections import defaultdict
 from datetime import datetime
 from typing import Optional
 
@@ -15,7 +16,7 @@ from sqlalchemy import (
     text,
     update as sql_update,
 )
-from sqlalchemy.dialects.postgresql import TSVECTOR
+from sqlalchemy.dialects.postgresql import TSVECTOR, insert
 from sqlalchemy.exc import ProgrammingError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
@@ -419,6 +420,11 @@ class SQLAlchemyService(DatabaseService):
                         delete(DocumentChunk).where(DocumentChunk.document_id == document_id)
                     )
                     await session.execute(
+                        delete(SessionDocument).where(
+                            SessionDocument.document_id == document_id
+                        )
+                    )
+                    await session.execute(
                         delete(Document).where(
                             Document.id == document_id,
                             Document.tenant_id == tenant_id,
@@ -739,6 +745,46 @@ class SQLAlchemyService(DatabaseService):
             logger.debug(f"[PostgreSQL] Stored chat message {msg_id} for session {session_id}")
             return msg_id
 
+    async def store_chat_turn(
+        self,
+        session_id: str,
+        question: str,
+        answer: str,
+        tenant_id: str,
+    ) -> tuple[str, str]:
+        tenant_id = require_tenant_id(tenant_id, method="store_chat_turn")
+        async with self.async_session() as session:
+            from core.models import ChatMessage
+
+            user_msg_id = str(uuid.uuid4())
+            assistant_msg_id = str(uuid.uuid4())
+            async with session.begin():
+                session.add(
+                    ChatMessage(
+                        id=user_msg_id,
+                        session_id=session_id,
+                        tenant_id=tenant_id,
+                        role="user",
+                        content=question,
+                    )
+                )
+                session.add(
+                    ChatMessage(
+                        id=assistant_msg_id,
+                        session_id=session_id,
+                        tenant_id=tenant_id,
+                        role="assistant",
+                        content=answer,
+                    )
+                )
+            logger.debug(
+                "[PostgreSQL] Stored chat turn for session %s (user=%s, assistant=%s)",
+                session_id,
+                user_msg_id,
+                assistant_msg_id,
+            )
+            return user_msg_id, assistant_msg_id
+
     async def get_session_history(
         self,
         session_id: str,
@@ -755,7 +801,10 @@ class SQLAlchemyService(DatabaseService):
                     ChatMessage.session_id == session_id,
                     ChatMessage.tenant_id == tenant_id,
                 )
-                .order_by(ChatMessage.created_at.desc())
+                .order_by(
+                    ChatMessage.created_at.desc(),
+                    ChatMessage.id.desc(),
+                )
                 .limit(limit)
             )
 
@@ -813,6 +862,31 @@ class SQLAlchemyService(DatabaseService):
             logger.info(f"[PostgreSQL] Created session {session_id} (tenant={tenant_id})")
             return self._session_from_record(record, [])
 
+    async def get_or_create_session_record(
+        self, session_id: str, tenant_id: Optional[str]
+    ) -> Optional[Session]:
+        async with self.async_session() as db_session:
+            stmt = (
+                insert(SessionRecord)
+                .values(id=session_id, tenant_id=tenant_id)
+                .on_conflict_do_nothing(index_elements=["id"])
+            )
+            await db_session.execute(stmt)
+            await db_session.commit()
+
+            result = await db_session.execute(
+                select(SessionRecord).where(SessionRecord.id == session_id)
+            )
+            record = result.scalar_one()
+            if tenant_id is not None and record.tenant_id is not None and record.tenant_id != tenant_id:
+                logger.warning(
+                    "get_or_create_session_record: tenant mismatch for session %s",
+                    session_id,
+                )
+                return None
+            doc_ids = await self._load_session_document_ids(db_session, session_id)
+            return self._session_from_record(record, doc_ids)
+
     async def get_session_record(
         self, session_id: str, tenant_id: Optional[str]
     ) -> Optional[Session]:
@@ -823,7 +897,7 @@ class SQLAlchemyService(DatabaseService):
             record = result.scalar_one_or_none()
             if record is None:
                 return None
-            if tenant_id and record.tenant_id and record.tenant_id != tenant_id:
+            if tenant_id is not None and record.tenant_id is not None and record.tenant_id != tenant_id:
                 logger.warning(
                     f"Session {session_id} tenant mismatch: {record.tenant_id} vs {tenant_id}"
                 )
@@ -841,52 +915,76 @@ class SQLAlchemyService(DatabaseService):
 
     async def list_session_records(self, tenant_id: Optional[str]) -> list[Session]:
         async with self.async_session() as db_session:
-            stmt = select(SessionRecord)
-            if tenant_id:
+            stmt = select(SessionRecord).order_by(
+                SessionRecord.last_active.desc(),
+                SessionRecord.id.desc(),
+            )
+            if tenant_id is not None:
                 stmt = stmt.where(SessionRecord.tenant_id == tenant_id)
             result = await db_session.execute(stmt)
             records = result.scalars().all()
-            sessions = []
-            for record in records:
-                doc_ids = await self._load_session_document_ids(db_session, record.id)
-                sessions.append(self._session_from_record(record, doc_ids))
-            return sessions
+            if not records:
+                return []
+
+            session_ids = [record.id for record in records]
+            doc_result = await db_session.execute(
+                select(SessionDocument.session_id, SessionDocument.document_id).where(
+                    SessionDocument.session_id.in_(session_ids)
+                )
+            )
+            docs_by_session: dict[str, list[str]] = defaultdict(list)
+            for session_id, document_id in doc_result.all():
+                docs_by_session[session_id].append(document_id)
+
+            return [
+                self._session_from_record(record, docs_by_session.get(record.id, []))
+                for record in records
+            ]
 
     async def delete_session_record(
         self, session_id: str, tenant_id: Optional[str]
     ) -> bool:
         async with self.async_session() as db_session:
-            result = await db_session.execute(
-                select(SessionRecord).where(SessionRecord.id == session_id)
-            )
-            record = result.scalar_one_or_none()
-            if record is None:
-                return False
-            if tenant_id and record.tenant_id and record.tenant_id != tenant_id:
-                logger.warning(
-                    f"delete_session_record: tenant mismatch for session {session_id}"
+            from core.models import ChatMessage
+
+            async with db_session.begin():
+                result = await db_session.execute(
+                    select(SessionRecord).where(SessionRecord.id == session_id)
                 )
-                return False
-            await db_session.execute(
-                delete(SessionRecord).where(SessionRecord.id == session_id)
-            )
-            await db_session.commit()
+                record = result.scalar_one_or_none()
+                if record is None:
+                    return False
+                if (
+                    tenant_id is not None
+                    and record.tenant_id is not None
+                    and record.tenant_id != tenant_id
+                ):
+                    logger.warning(
+                        f"delete_session_record: tenant mismatch for session {session_id}"
+                    )
+                    return False
+                await db_session.execute(
+                    delete(ChatMessage).where(
+                        ChatMessage.session_id == session_id,
+                        ChatMessage.tenant_id == record.tenant_id,
+                    )
+                )
+                await db_session.execute(
+                    delete(SessionRecord).where(SessionRecord.id == session_id)
+                )
             logger.info(f"[PostgreSQL] Deleted session {session_id}")
             return True
 
     async def add_session_document(self, session_id: str, document_id: str) -> None:
         async with self.async_session() as db_session:
-            existing = await db_session.execute(
-                select(SessionDocument).where(
-                    SessionDocument.session_id == session_id,
-                    SessionDocument.document_id == document_id,
+            stmt = (
+                insert(SessionDocument)
+                .values(session_id=session_id, document_id=document_id)
+                .on_conflict_do_nothing(
+                    index_elements=["session_id", "document_id"]
                 )
             )
-            if existing.scalar_one_or_none() is not None:
-                return
-            db_session.add(
-                SessionDocument(session_id=session_id, document_id=document_id)
-            )
+            await db_session.execute(stmt)
             await db_session.commit()
             logger.debug(
                 f"[PostgreSQL] Bound document {document_id} to session {session_id}"
