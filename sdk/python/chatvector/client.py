@@ -305,6 +305,10 @@ class ChatVectorClient:
         """
         Run multiple chat queries in a single API call.
 
+        A batch item that names exactly one document is treated as compare-style:
+        session history is not injected and successful turns are not persisted,
+        even when ``session_id`` is set.
+
         Args:
             queries: List of batch query payloads or ``BatchChatQuery`` models.
             session_id: Optional shared session identifier for the batch.

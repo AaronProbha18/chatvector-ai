@@ -140,11 +140,10 @@ async def stepback_query(question: str) -> list[str]:
 def _format_history_context(history: list[dict]) -> str:
     """Render session history as a conversational context string.
 
-    History arrives ordered most-recent-first (as returned by get_session_history).
-    We reverse it so the prompt reads chronologically.
+    History arrives in chronological order (oldest first).
     """
     lines: list[str] = []
-    for msg in reversed(history):
+    for msg in history:
         role = msg.get("role", "")
         content = (msg.get("content") or "").strip()
         if role == "user":

@@ -87,6 +87,9 @@ async def test_document_binding_persisted(svc):
 @pytest.mark.asyncio
 async def test_delete_session_cascades_documents(svc):
     """Deleting a session removes its session_documents rows."""
+    from sqlalchemy import func, select
+    from core.models import SessionDocument
+
     session_id = f"persist-del-{uuid.uuid4()}"
     tenant_id = "test-tenant-del"
     doc_id = f"doc-{uuid.uuid4()}"
@@ -94,8 +97,24 @@ async def test_delete_session_cascades_documents(svc):
     await svc.create_session_record(session_id, tenant_id)
     await svc.add_session_document(session_id, doc_id)
 
+    async with svc.async_session() as session:
+        before = await session.execute(
+            select(func.count())
+            .select_from(SessionDocument)
+            .where(SessionDocument.session_id == session_id)
+        )
+        assert int(before.scalar_one()) == 1
+
     deleted = await svc.delete_session_record(session_id, tenant_id)
     assert deleted is True
+
+    async with svc.async_session() as session:
+        after = await session.execute(
+            select(func.count())
+            .select_from(SessionDocument)
+            .where(SessionDocument.session_id == session_id)
+        )
+        assert int(after.scalar_one()) == 0
 
     fetched = await svc.get_session_record(session_id, tenant_id)
     assert fetched is None

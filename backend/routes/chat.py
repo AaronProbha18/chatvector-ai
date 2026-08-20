@@ -15,6 +15,8 @@ from services.chat_service import (
     answer_question_for_document,
     answer_question_stream_for_document,
     answer_questions_for_documents_batch,
+    merge_batch_results,
+    prepare_batch_chat_items,
 )
 from services.session_service import get_or_create_session, register_session_document
 from services.tenant_registry import register_tenant_document
@@ -103,10 +105,24 @@ class ChatBatchItem(BaseModel):
 
 
 class ChatBatchRequest(BaseModel):
-    queries: list[ChatBatchItem] = Field(..., min_length=1, max_length=20)
+    queries: list[ChatBatchItem] = Field(..., min_length=1)
     session_id: Optional[str] = None
     scope: RetrievalScopeParam = "session"
     debug_retrieval: bool = False
+
+
+class ChatResponse(BaseModel):
+    question: str
+    doc_id: str
+    chunks: int
+    answer: str
+    sources: list[ChatSourceResponse] = Field(default_factory=list)
+    latency_ms: int = 0
+    model: str = ""
+    status: Literal["ok", "error"] = "ok"
+    session_id: Optional[str] = None
+    error: Optional[dict] = None
+    retrieval_debug: Optional[dict] = None
 
 
 class ChatRequest(BaseModel):
@@ -122,7 +138,7 @@ def _resolve_debug_retrieval(*, query_param: bool, request_field: bool) -> bool:
     return query_param or request_field
 
 
-@router.post("/chat")
+@router.post("/chat", response_model=ChatResponse)
 @limiter.limit(config.RATE_LIMIT_CHAT)
 async def chat(
     request: Request,
@@ -176,10 +192,11 @@ async def chat_stream(
     - ``done`` — legacy completion marker ``[DONE]`` (deprecated; retained for
       backward compatibility).
     - ``error`` — structured JSON object ``{"type": "error", "code": "...", "message": "..."}``.
+      Terminal: may follow ``token`` events; no ``complete`` or ``done`` is emitted.
 
     Interrupted streams (client disconnect, cancellation, or provider failure
     mid-stream) do not persist assistant messages. Successful streams persist
-    user and assistant messages after the ``complete`` event is emitted.
+    the user/assistant turn atomically before the ``complete`` event is emitted.
     """
     if not config.ENABLE_STREAMING:
         raise HTTPException(
@@ -237,35 +254,35 @@ async def chat_batch(
     tenant_id = require_current_tenant(auth)
 
     try:
-        # Pre-process queries to inject session_id if missing
-        processed_queries = []
+        raw_queries = []
         for q in payload.queries:
             q_dict = q.model_dump(mode="json")
-            # Only keep per-item scope when explicitly provided by the caller.
-            # When unset, let the batch-level `scope` take effect in the service.
             if "scope" not in q.model_fields_set:
                 q_dict.pop("scope", None)
-            q_session = await get_or_create_session(
-                session_id=q.session_id or batch_session_id,
-                tenant_id=tenant_id,
-            )
-            q_dict["session_id"] = q_session.id
-            for doc_id in q.doc_ids:
-                doc_id_str = str(doc_id)
-                await _assert_document_owned(doc_id_str, tenant_id)
-                await register_session_document(q_session.id, doc_id_str, tenant_id)
-                register_tenant_document(tenant_id, doc_id_str)
-            processed_queries.append(q_dict)
+            raw_queries.append(q_dict)
 
-        results = await answer_questions_for_documents_batch(
-            processed_queries,
-            auth=auth,
-            scope=payload.scope,
-            debug_retrieval=_resolve_debug_retrieval(
-                query_param=debug_retrieval,
-                request_field=payload.debug_retrieval,
-            ),
+        service_items, slot_results = await prepare_batch_chat_items(
+            raw_queries,
+            tenant_id=tenant_id,
+            batch_session_id=batch_session_id,
         )
+        service_indices = [index for index, _ in service_items]
+        service_queries = [query for _, query in service_items]
+
+        if service_queries:
+            service_results = await answer_questions_for_documents_batch(
+                service_queries,
+                auth=auth,
+                scope=payload.scope,
+                debug_retrieval=_resolve_debug_retrieval(
+                    query_param=debug_retrieval,
+                    request_field=payload.debug_retrieval,
+                ),
+            )
+        else:
+            service_results = []
+
+        results = merge_batch_results(slot_results, service_indices, service_results)
     except ValueError as e:
         raise HTTPException(
             status_code=422,

@@ -121,7 +121,7 @@ async def test_stream_finalization_persistence():
          patch("services.chat_service.get_session", new=AsyncMock(return_value=None)), \
          patch("services.chat_service.generate_answer_stream") as mock_stream, \
          patch("db.get_session_history", new=AsyncMock(return_value=[])) as mock_history, \
-         patch("db.store_chat_message", new=AsyncMock()) as mock_store:
+         patch("db.store_chat_turn", new=AsyncMock()) as mock_store:
          
         async def fake_stream(*args, **kwargs):
             yield "stream part 1 "
@@ -142,13 +142,8 @@ async def test_stream_finalization_persistence():
             tenant_id="dev",
             limit=config.MAX_SESSION_HISTORY_MESSAGES,
         )
-        assert mock_store.call_count == 2
-        
-        # Check that user question and full assistant answer were stored
-        call_1_kwargs = mock_store.call_args_list[0].kwargs
-        assert call_1_kwargs["role"] == "user"
-        assert call_1_kwargs["content"] == "Stream Q?"
-        
-        call_2_kwargs = mock_store.call_args_list[1].kwargs
-        assert call_2_kwargs["role"] == "assistant"
-        assert call_2_kwargs["content"] == "stream part 1 stream part 2"
+        assert mock_store.await_count == 1
+        call_kwargs = mock_store.call_args.kwargs
+        assert call_kwargs["question"] == "Stream Q?"
+        assert call_kwargs["answer"] == "stream part 1 stream part 2"
+        assert call_kwargs["session_id"] == session_id

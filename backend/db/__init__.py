@@ -343,6 +343,22 @@ async def store_chat_message(
     )
 
 
+async def store_chat_turn(
+    session_id: str,
+    question: str,
+    answer: str,
+    tenant_id: str,
+) -> tuple[str, str]:
+    tenant_id = require_tenant_id(tenant_id, method="store_chat_turn")
+    service = get_db_service()
+    return await service.store_chat_turn(
+        session_id=session_id,
+        question=question,
+        answer=answer,
+        tenant_id=tenant_id,
+    )
+
+
 async def get_session_history(
     session_id: str,
     tenant_id: str,
@@ -372,6 +388,11 @@ async def create_session_record(session_id: str, tenant_id) -> "Session":
 
     service = get_db_service()
     return await service.create_session_record(session_id, tenant_id)
+
+
+async def get_or_create_session_record(session_id: str, tenant_id) -> "Session | None":
+    service = get_db_service()
+    return await service.get_or_create_session_record(session_id, tenant_id)
 
 
 async def get_session_record(session_id: str, tenant_id) -> "Session | None":
@@ -454,8 +475,10 @@ __all__ = [
     "list_applied_migrations",
     "fail_stale_documents_global",
     "store_chat_message",
+    "store_chat_turn",
     "get_session_history",
     "create_session_record",
+    "get_or_create_session_record",
     "get_session_record",
     "list_session_records",
     "delete_session_record",

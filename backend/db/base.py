@@ -161,6 +161,17 @@ class DatabaseService(ABC):
         pass
 
     @abstractmethod
+    async def store_chat_turn(
+        self,
+        session_id: str,
+        question: str,
+        answer: str,
+        tenant_id: str,
+    ) -> tuple[str, str]:
+        """Store a user/assistant chat turn atomically for a tenant-owned session."""
+        pass
+
+    @abstractmethod
     async def get_session_history(
         self,
         session_id: str,

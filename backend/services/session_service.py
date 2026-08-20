@@ -44,24 +44,27 @@ async def get_or_create_session(
 ) -> Session:
     """Retrieve an existing session or create a new one.
 
-    If session_id is provided but not found (or belongs to a different tenant),
-    a new session is created with a fresh UUID.
+    If session_id is provided but not found, a conflict-safe insert converges
+    concurrent first-use requests on one session. If the ID exists for a
+    different tenant, a new session is created with a fresh UUID.
     """
     if session_id:
         session = await get_session(session_id, tenant_id)
         if session:
             return session
 
-    try:
-        return await create_session(session_id, tenant_id)
-    except ValueError:
-        # session_id already exists for a different tenant — create with new ID
+        created = await db.get_or_create_session_record(session_id, tenant_id)
+        if created is not None:
+            logger.info(
+                "Retrieved or created session via get-or-create: %s (tenant=%s)",
+                session_id,
+                tenant_id,
+            )
+            return created
+
         return await create_session(None, tenant_id)
 
-
-async def reset_session(session_id: str) -> bool:
-    """Remove a session from the store."""
-    return await delete_session(session_id)
+    return await create_session(None, tenant_id)
 
 
 async def register_session_document(

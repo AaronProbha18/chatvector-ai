@@ -46,6 +46,8 @@ export class ChatsResource {
     request: BatchChatRequest,
     options: RequestOptions = {},
   ): Promise<BatchChatResponse> {
+    // Single-document batch items are compare-style: no session history injection
+    // and no turn persistence, even when sessionId is set on the item or request.
     if (!request || !Array.isArray(request.queries)) {
       throw new TypeError("queries must be an array");
     }
@@ -127,6 +129,7 @@ function mapChatResponse(payload: Record<string, unknown>): ChatResponse {
     status: payload.status === "error" ? "error" : "ok",
     _raw: payload,
   };
+  if (typeof payload.session_id === "string") result.sessionId = payload.session_id;
   const error = mapSoftError(payload.error);
   if (error) result.error = error;
   return result;
@@ -157,6 +160,7 @@ function mapBatchResult(payload: Record<string, unknown>): BatchChatResult {
   };
   if (typeof payload.answer === "string") result.answer = payload.answer;
   if (Array.isArray(payload.sources)) result.sources = mapSources(payload.sources);
+  if (typeof payload.session_id === "string") result.sessionId = payload.session_id;
   const error = mapSoftError(payload.error);
   if (error) result.error = error;
   return result;

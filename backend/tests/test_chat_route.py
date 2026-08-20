@@ -59,12 +59,28 @@ def test_chat_batch_route_delegates_to_chat_service():
 
     with (
         patch(
+            "routes.chat.prepare_batch_chat_items",
+            new=AsyncMock(
+                return_value=(
+                    [
+                        (
+                            0,
+                            {
+                                "question": "q",
+                                "doc_ids": [_DOC_ID_1],
+                                "match_count": 5,
+                                "session_id": "mock-session-id",
+                            },
+                        )
+                    ],
+                    [None],
+                )
+            ),
+        ),
+        patch(
             "routes.chat.answer_questions_for_documents_batch",
             new=AsyncMock(return_value=payload["results"]),
         ) as mock_batch,
-        patch("routes.chat.db.get_document", new=AsyncMock(return_value=_FAKE_DOC)),
-        patch("routes.chat.get_or_create_session", new=AsyncMock(return_value=_FAKE_SESSION)),
-        patch("routes.chat.register_session_document", new=AsyncMock()),
     ):
         result = asyncio.run(
             chat_batch(make_test_request("POST", "/chat/batch"), batch_request, auth=AuthContext(tenant_id="dev"))
@@ -84,6 +100,18 @@ def test_chat_batch_route_counts_failures_and_successes():
 
     with (
         patch(
+            "routes.chat.prepare_batch_chat_items",
+            new=AsyncMock(
+                return_value=(
+                    [
+                        (0, {"question": "q1", "doc_ids": [_DOC_ID_1], "match_count": 5, "session_id": "mock-session-id"}),
+                        (1, {"question": "q2", "doc_ids": [_DOC_ID_2], "match_count": 5, "session_id": "mock-session-id"}),
+                    ],
+                    [None, None],
+                )
+            ),
+        ),
+        patch(
             "routes.chat.answer_questions_for_documents_batch",
             new=AsyncMock(
                 return_value=[
@@ -98,9 +126,6 @@ def test_chat_batch_route_counts_failures_and_successes():
                 ]
             ),
         ),
-        patch("routes.chat.db.get_document", new=AsyncMock(return_value=_FAKE_DOC)),
-        patch("routes.chat.get_or_create_session", new=AsyncMock(return_value=_FAKE_SESSION)),
-        patch("routes.chat.register_session_document", new=AsyncMock()),
     ):
         result = asyncio.run(
             chat_batch(make_test_request("POST", "/chat/batch"), batch_request, auth=AuthContext(tenant_id="dev"))
@@ -114,14 +139,9 @@ def test_chat_batch_route_counts_failures_and_successes():
 def test_chat_batch_route_returns_422_for_value_error():
     batch_request = ChatBatchRequest(queries=[ChatBatchItem(question="q", doc_ids=[_DOC_ID_1])])
 
-    with (
-        patch(
-            "routes.chat.answer_questions_for_documents_batch",
-            new=AsyncMock(side_effect=ValueError("invalid payload")),
-        ),
-        patch("routes.chat.db.get_document", new=AsyncMock(return_value=_FAKE_DOC)),
-        patch("routes.chat.get_or_create_session", new=AsyncMock(return_value=_FAKE_SESSION)),
-        patch("routes.chat.register_session_document", new=AsyncMock()),
+    with patch(
+        "routes.chat.prepare_batch_chat_items",
+        new=AsyncMock(side_effect=ValueError("invalid payload")),
     ):
         try:
             asyncio.run(

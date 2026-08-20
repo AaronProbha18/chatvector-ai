@@ -228,7 +228,12 @@ class AsyncChatVectorClient:
         session_id: str | None = None,
         scope: RetrievalScope | None = None,
     ) -> BatchChatResponse:
-        """Run multiple chat queries in a single API call."""
+        """Run multiple chat queries in a single API call.
+
+        A batch item that names exactly one document is compare-style: session
+        history is not injected and successful turns are not persisted, even when
+        ``session_id`` is set.
+        """
         payload: JSONDict = {
             "queries": [self._serialize_batch_query(query) for query in queries],
         }
