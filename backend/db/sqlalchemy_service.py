@@ -17,7 +17,7 @@ from sqlalchemy import (
     update as sql_update,
 )
 from sqlalchemy.dialects.postgresql import TSVECTOR, insert
-from sqlalchemy.exc import ProgrammingError
+from sqlalchemy.exc import ProgrammingError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, create_async_engine
 from sqlalchemy.orm import sessionmaker
 
@@ -81,7 +81,12 @@ class SQLAlchemyService(DatabaseService):
     """
 
     def __init__(self):
-        db_url = os.getenv("DATABASE_URL", "postgresql://postgres:postgres@localhost:5432/postgres")
+        db_url = config.DATABASE_URL
+        if not db_url:
+            raise ValueError(
+                "DATABASE_URL is not set. Set DATABASE_URL to a PostgreSQL connection "
+                "string with pgvector enabled."
+            )
         async_url = db_url.replace("postgresql://", "postgresql+asyncpg://")
 
         self.engine = create_async_engine(
@@ -729,6 +734,28 @@ class SQLAlchemyService(DatabaseService):
                 }
                 for document in result.scalars().all()
             ]
+
+    async def ping_and_count_tenant_documents(
+        self, tenant_id: str
+    ) -> tuple[bool, int | None]:
+        tenant_id = require_tenant_id(
+            tenant_id, method="ping_and_count_tenant_documents"
+        )
+        try:
+            async with self.async_session() as session:
+                await session.execute(text("SELECT 1"))
+                count = await session.scalar(
+                    select(func.count())
+                    .select_from(Document)
+                    .where(Document.tenant_id == tenant_id)
+                )
+            return True, int(count or 0)
+        except (SQLAlchemyError, OSError) as exc:
+            logger.warning("Database health check failed: %s", exc)
+            return False, None
+        except Exception:
+            logger.exception("Unexpected error during database health check")
+            return False, None
 
     async def store_chat_message(
         self,

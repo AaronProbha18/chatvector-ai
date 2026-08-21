@@ -192,6 +192,103 @@ async def generate_answer(question: str, context: str) -> tuple[str, int, str]:
         )
         return _msg_unexpected(), 0, ""
 
+
+async def probe_llm_health(question: str, context: str) -> tuple[str, int, str]:
+    """Single-attempt LLM probe for /status (no production retry policy).
+
+    Returns the same 3-tuple shape as :func:`generate_answer`.
+    """
+    contents = f"CONTEXT:\n{context}\n\nQUESTION:\n{question}"
+
+    if not _api_key_present():
+        logger.error(
+            "LLM health probe: API key is missing or empty for provider %s",
+            config.LLM_PROVIDER,
+            extra={"error_type": "MissingAPIKey"},
+        )
+        return _msg_missing_api_key(), 0, ""
+
+    try:
+        provider = get_llm_provider()
+        t0 = time.perf_counter()
+
+        async def _generate() -> str:
+            return await provider.generate(
+                contents,
+                system_instruction=_get_system_prompt(),
+                temperature=config.LLM_TEMPERATURE,
+                max_output_tokens=config.LLM_MAX_OUTPUT_TOKENS,
+            )
+
+        answer = await retry_async(
+            _generate,
+            max_retries=0,
+            base_delay=0,
+            backoff=1.0,
+            timeout=float(config.LLM_HEALTH_CHECK_TIMEOUT_SEC),
+            func_name="answer_service.probe_llm_health",
+        )
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+        return answer, latency_ms, getattr(provider, "model_name", "")
+
+    except ProviderRateLimitError as e:
+        logger.error(
+            "LLM health probe rate limit (%s): %s",
+            type(e).__name__,
+            e,
+            extra={"error_type": type(e).__name__},
+        )
+        return _msg_rate_limit(), 0, ""
+
+    except ProviderAuthError as e:
+        logger.error(
+            "LLM health probe auth error (%s): %s",
+            type(e).__name__,
+            e,
+            extra={"error_type": type(e).__name__},
+        )
+        return _msg_invalid_api_key(), 0, ""
+
+    except ProviderTimeoutError as e:
+        logger.error(
+            "LLM health probe timeout (%s): %s",
+            type(e).__name__,
+            e,
+            exc_info=True,
+            extra={"error_type": type(e).__name__},
+        )
+        return _msg_timeout_or_connection(), 0, ""
+
+    except ProviderConnectionError as e:
+        logger.error(
+            "LLM health probe connection error (%s): %s",
+            type(e).__name__,
+            e,
+            exc_info=True,
+            extra={"error_type": type(e).__name__},
+        )
+        return _msg_timeout_or_connection(), 0, ""
+
+    except asyncio.TimeoutError as e:
+        logger.error(
+            "LLM health probe timed out (%s)",
+            type(e).__name__,
+            exc_info=True,
+            extra={"error_type": type(e).__name__},
+        )
+        return _msg_timeout_or_connection(), 0, ""
+
+    except Exception as e:
+        logger.error(
+            "LLM health probe unexpected error (%s): %s",
+            type(e).__name__,
+            e,
+            exc_info=True,
+            extra={"error_type": type(e).__name__},
+        )
+        return _msg_unexpected(), 0, ""
+
+
 async def generate_answer_stream(question: str, context: str) -> AsyncGenerator[str, None]:
     """
     Generate an answer token-by-token using the configured LLM provider.

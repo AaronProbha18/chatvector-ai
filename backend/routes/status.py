@@ -11,8 +11,6 @@ from typing import Any
 import psutil
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import HTMLResponse
-from sqlalchemy import func, select, text
-from sqlalchemy.exc import SQLAlchemyError
 
 import db
 from core.auth import AuthContext, require_auth
@@ -31,6 +29,14 @@ _BAR_WIDTH = 10
 _HEALTH_CHECK_CACHE: dict[str, dict[str, Any]] = {}
 _HEALTH_CHECK_CACHE_LOCKS: dict[str, asyncio.Lock] = {}
 REDIS_HEALTH_CACHE_PREFIX = "chatvector:health_cache"
+
+HEALTH_ERROR_CODES = frozenset({
+    "timeout",
+    "rate_limited",
+    "api_key_missing",
+    "disconnected",
+    "error",
+})
 
 
 def _read_version() -> str:
@@ -97,34 +103,35 @@ async def _database_connected_and_document_count(
     tenant_id: str,
 ) -> tuple[bool, int | None]:
     service = db.get_db_service()
-    from db.sqlalchemy_service import SQLAlchemyService
-
-    if isinstance(service, SQLAlchemyService):
-        from core.models import Document as DocumentModel
-
-        try:
-            async with service.async_session() as session:
-                await session.execute(text("SELECT 1"))
-                count = await session.scalar(
-                    select(func.count())
-                    .select_from(DocumentModel)
-                    .where(DocumentModel.tenant_id == tenant_id)
-                )
-            return True, int(count or 0)
-        except (SQLAlchemyError, OSError) as exc:
-            logger.warning("Database health check failed: %s", exc)
-            return False, None
-        except Exception:
-            logger.exception("Unexpected error during database health check")
-            return False, None
-
-    logger.error("Unknown database service type for status: %s", type(service))
-    return False, None
+    return await service.ping_and_count_tenant_documents(tenant_id)
 
 
-def _short_error_message(exc: BaseException, max_len: int = 120) -> str:
-    msg = str(exc).strip() or type(exc).__name__
-    return msg[:max_len]
+def _classify_provider_exception(exc: BaseException) -> str:
+    from services.providers.base import (
+        ProviderConnectionError,
+        ProviderRateLimitError,
+        ProviderTimeoutError,
+    )
+
+    if isinstance(exc, ProviderRateLimitError):
+        return "rate_limited"
+    if isinstance(exc, (ProviderTimeoutError, ProviderConnectionError, asyncio.TimeoutError)):
+        return "timeout"
+    return "error"
+
+
+def _classify_redis_exception(exc: BaseException) -> str:
+    if isinstance(exc, asyncio.TimeoutError):
+        return "timeout"
+    try:
+        import redis as redis_lib
+
+        if isinstance(exc, (redis_lib.exceptions.ConnectionError, ConnectionError, OSError)):
+            return "disconnected"
+    except ImportError:
+        if isinstance(exc, (ConnectionError, OSError)):
+            return "disconnected"
+    return "error"
 
 
 def _health_check_checked_at(ts: float) -> str:
@@ -233,12 +240,12 @@ async def _run_health_check_with_cache(
 
 
 async def _embedding_health_check() -> dict:
-    from services.embedding_service import get_embedding
+    from services.embedding_service import probe_embedding_health
 
     t0 = time.monotonic()
     try:
         await asyncio.wait_for(
-            get_embedding("health check"),
+            probe_embedding_health("health check"),
             timeout=float(config.EMBEDDING_HEALTH_CHECK_TIMEOUT_SEC),
         )
         latency_ms = int((time.monotonic() - t0) * 1000)
@@ -246,7 +253,8 @@ async def _embedding_health_check() -> dict:
     except asyncio.TimeoutError:
         return {"status": "error", "error": "timeout"}
     except Exception as e:
-        return {"status": "error", "error": _short_error_message(e)}
+        logger.warning("Embedding health check failed", exc_info=True)
+        return {"status": "error", "error": _classify_provider_exception(e)}
 
 
 def _llm_error_code_from_answer_text(text: str) -> str | None:
@@ -268,35 +276,22 @@ def _llm_error_code_from_answer_text(text: str) -> str | None:
     return None
 
 
-def _llm_classify_exception(exc: BaseException) -> str:
-    from services.providers.base import (
-        ProviderConnectionError,
-        ProviderRateLimitError,
-        ProviderTimeoutError,
-    )
-
-    if isinstance(exc, ProviderRateLimitError):
-        return "rate_limited"
-    if isinstance(exc, (ProviderTimeoutError, ProviderConnectionError)):
-        return "timeout"
-    return "error"
-
-
 async def _llm_health_check() -> dict:
-    from services.answer_service import generate_answer
+    from services.answer_service import probe_llm_health
 
     t0 = time.monotonic()
     try:
-        result = await asyncio.wait_for(
-            generate_answer("health check", "context: ok"),
-            timeout=config.LLM_HEALTH_CHECK_TIMEOUT_SEC,
+        answer, _, _ = await asyncio.wait_for(
+            probe_llm_health("health check", "context: ok"),
+            timeout=float(config.LLM_HEALTH_CHECK_TIMEOUT_SEC),
         )
     except asyncio.TimeoutError:
         return {"status": "error", "error": "timeout"}
     except Exception as e:
-        return {"status": "error", "error": _llm_classify_exception(e)}
+        logger.warning("LLM health check failed", exc_info=True)
+        return {"status": "error", "error": _classify_provider_exception(e)}
 
-    err_code = _llm_error_code_from_answer_text(result)
+    err_code = _llm_error_code_from_answer_text(answer)
     if err_code is not None:
         return {"status": "error", "error": err_code}
 
@@ -311,7 +306,8 @@ async def _redis_health_check() -> dict:
         latency_ms = int((time.monotonic() - t0) * 1000)
         return {"status": "ok", "latency_ms": latency_ms}
     except Exception as e:
-        return {"status": "error", "error": _short_error_message(e)}
+        logger.warning("Redis health check failed", exc_info=True)
+        return {"status": "error", "error": _classify_redis_exception(e)}
 
 def _overall_status(db_ok: bool, embedding_ok: bool, llm_ok: bool, redis_ok: bool) -> str:
     if not db_ok or not redis_ok:
@@ -451,9 +447,9 @@ def _status_fallback_health_dict(exc: BaseException, label: str) -> dict:
     logger.exception("%s health check raised unexpectedly", label)
     return {
         "status": "error",
-        "error": _short_error_message(exc),
+        "error": "error",
         "cached": False,
-        "checked_at": datetime.utcnow().isoformat() + "Z",
+        "checked_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
     }
 
 @router.get("/health", include_in_schema=False)

@@ -1,27 +1,23 @@
--- Enforce documents.tenant_id NOT NULL and align tenant FK delete behavior.
+-- Reconcile documents.tenant_id NOT NULL for installations that recorded
+-- 009_documents_tenant_id_not_null.sql without applying the constraint.
+--
+-- Fresh installs: 009 (fixed) already enforces NOT NULL; this migration is
+-- idempotent and records completion for the reconciliation step.
 --
 -- ────────────────────────────────────────────────────────────────────────────
--- EXISTING INSTALLATIONS
+-- EXISTING INSTALLATIONS WITH NULL tenant_id
 -- ────────────────────────────────────────────────────────────────────────────
--- If any documents still have tenant_id IS NULL, this migration aborts and
--- does not record itself in schema_migrations. Backfill first:
+-- Backfill or delete orphaned rows before applying:
 --
---   -- Option A: assign orphaned documents to a known tenant
---   UPDATE documents
---      SET tenant_id = '<your-tenant-id>'
---    WHERE tenant_id IS NULL;
---
---   -- Option B: delete orphaned documents (irreversible)
+--   UPDATE documents SET tenant_id = '<tenant-id>' WHERE tenant_id IS NULL;
+--   -- or --
 --   DELETE FROM documents WHERE tenant_id IS NULL;
 --
 -- Then re-run:
 --
---   docker compose exec db psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
---       -f /docker-entrypoint-initdb.d/009_documents_tenant_id_not_null.sql
---
--- Once NOT NULL is enforced, tenant deletion cascades to owned documents.
--- The previous ON DELETE SET NULL behavior from 006 is incompatible with
--- NOT NULL and is replaced by ON DELETE CASCADE.
+--   docker compose exec db psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" \
+--       -v ON_ERROR_STOP=1 \
+--       -f /docker-entrypoint-initdb.d/012_documents_tenant_id_not_null_reconcile.sql
 --
 -- ────────────────────────────────────────────────────────────────────────────
 -- ROLLBACK
@@ -32,18 +28,21 @@
 --       ADD CONSTRAINT fk_documents_tenant_id
 --       FOREIGN KEY (tenant_id) REFERENCES tenants(id)
 --       ON DELETE SET NULL;
+--   DELETE FROM public.schema_migrations
+--    WHERE filename = '012_documents_tenant_id_not_null_reconcile.sql';
 
 BEGIN;
 
 DO $$
 DECLARE
     null_count BIGINT;
+    is_nullable TEXT;
 BEGIN
     SELECT COUNT(*) INTO null_count FROM documents WHERE tenant_id IS NULL;
 
     IF null_count > 0 THEN
         RAISE EXCEPTION
-            'Migration 009_documents_tenant_id_not_null.sql cannot proceed: % document(s) still have NULL tenant_id. Backfill or delete orphaned rows, then re-run 009.',
+            'Migration 012_documents_tenant_id_not_null_reconcile.sql cannot proceed: % document(s) still have NULL tenant_id. Backfill or delete orphaned rows, then re-run 012.',
             null_count
             USING HINT = (
                 'Example: UPDATE documents SET tenant_id = ''<tenant-id>'' '
@@ -51,7 +50,15 @@ BEGIN
             );
     END IF;
 
-    ALTER TABLE documents ALTER COLUMN tenant_id SET NOT NULL;
+    SELECT c.is_nullable INTO is_nullable
+      FROM information_schema.columns c
+     WHERE c.table_schema = 'public'
+       AND c.table_name = 'documents'
+       AND c.column_name = 'tenant_id';
+
+    IF is_nullable = 'YES' THEN
+        ALTER TABLE documents ALTER COLUMN tenant_id SET NOT NULL;
+    END IF;
 
     IF EXISTS (
         SELECT 1
@@ -70,7 +77,7 @@ END;
 $$;
 
 INSERT INTO public.schema_migrations (filename)
-VALUES ('009_documents_tenant_id_not_null.sql')
+VALUES ('012_documents_tenant_id_not_null_reconcile.sql')
 ON CONFLICT (filename) DO NOTHING;
 
 COMMIT;
