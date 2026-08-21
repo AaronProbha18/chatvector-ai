@@ -91,7 +91,15 @@ export class ChatsResource {
     });
 
     try {
-      yield* iterChatStreamEvents(response, options.signal);
+      const streamOptions: { signal?: AbortSignal; apiKey?: string } = {};
+      const apiKey = this.http.configuredApiKey();
+      if (apiKey !== undefined) {
+        streamOptions.apiKey = apiKey;
+      }
+      if (options.signal !== undefined) {
+        streamOptions.signal = options.signal;
+      }
+      yield* iterChatStreamEvents(response, streamOptions);
     } finally {
       try {
         await response.body?.cancel();

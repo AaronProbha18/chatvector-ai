@@ -76,6 +76,7 @@ export type ChatStreamEvent =
       sources: ChatSource[];
       latencyMs: number;
       model: string;
+      _raw?: Record<string, unknown>;
     };
 
 export type ChatResponse = {

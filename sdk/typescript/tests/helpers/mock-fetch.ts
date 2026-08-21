@@ -57,6 +57,48 @@ export function sseResponse(body: string): Response {
   });
 }
 
+/** Enqueues SSE bytes one chunk at a time through a real ReadableStream body. */
+export function chunkedSseResponse(chunks: Uint8Array[]): Response {
+  let index = 0;
+  const stream = new ReadableStream<Uint8Array>({
+    pull(controller) {
+      if (index >= chunks.length) {
+        controller.close();
+        return;
+      }
+      controller.enqueue(chunks[index]!);
+      index += 1;
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
+/** SSE body that enqueues one event then blocks until the stream is cancelled. */
+export function pendingAfterFirstEventSseResponse(firstEventBytes: Uint8Array): Response {
+  let cancelled = false;
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      controller.enqueue(firstEventBytes);
+    },
+    pull(_controller) {
+      // Remain pending until cancel/abort tears the stream down.
+      if (!cancelled) {
+        return new Promise<void>(() => undefined);
+      }
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  return new Response(stream, {
+    status: 200,
+    headers: { "Content-Type": "text/event-stream" },
+  });
+}
+
 export function emptyResponse(status = 204): Response {
   return new Response(null, { status });
 }

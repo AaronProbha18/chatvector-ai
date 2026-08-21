@@ -21,6 +21,7 @@ import {
   throwIfAborted,
   type Clock,
 } from "./time.js";
+import { redactSecret, redactText } from "./redact.js";
 import { isRecord } from "./utils.js";
 
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -119,6 +120,11 @@ export class HttpClient {
     options: HttpRequestOptions = {},
   ): Promise<void> {
     await this.request(method, path, options, false);
+  }
+
+  /** @internal Exposed for streaming resources that redact SSE error payloads. */
+  configuredApiKey(): string | undefined {
+    return this.apiKey;
   }
 
   async openStream(
@@ -511,33 +517,6 @@ function defaultErrorMessage(statusCode: number): string {
   }
   return `ChatVector returned HTTP ${statusCode}.`;
 }
-
-function redactText(value: string, secret: string | undefined): string {
-  return secret ? value.replaceAll(secret, "[REDACTED]") : value;
-}
-
-function redactSecret(value: unknown, secret: string | undefined): unknown {
-  if (!secret) {
-    return value;
-  }
-  if (typeof value === "string") {
-    return redactText(value, secret);
-  }
-  if (Array.isArray(value)) {
-    return value.map((item) => redactSecret(item, secret));
-  }
-  if (isRecord(value)) {
-    return Object.fromEntries(
-      Object.entries(value).map(([key, item]) => [
-        redactText(key, secret),
-        redactSecret(item, secret),
-      ]),
-    );
-  }
-  return value;
-}
-
-
 
 function abortError(): DOMException {
   return new DOMException("The operation was aborted", "AbortError");

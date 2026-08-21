@@ -5,9 +5,17 @@ import {
   ChatVectorTimeoutError,
 } from "../errors.js";
 import type { ChatSource, ChatStreamEvent } from "../models.js";
+import { redactSecret, redactText } from "./redact.js";
+import { abortReason } from "./time.js";
 import { isRecord, stringValue } from "./utils.js";
 
 const DONE_PAYLOAD = "[DONE]";
+const MAX_MALFORMED_SSE_DATA_CHARS = 256;
+
+export type StreamParseOptions = {
+  signal?: AbortSignal;
+  apiKey?: string;
+};
 
 type StreamErrorPayload = {
   code: string;
@@ -15,9 +23,15 @@ type StreamErrorPayload = {
   raw: Record<string, unknown>;
 };
 
-export function mapStreamError(error: StreamErrorPayload): ChatVectorAPIError {
-  const message = error.message || "ChatVector streaming request failed.";
-  const details = error.raw;
+export function mapStreamError(
+  error: StreamErrorPayload,
+  apiKey?: string,
+): ChatVectorAPIError {
+  const message = redactText(
+    error.message || "ChatVector streaming request failed.",
+    apiKey,
+  );
+  const details = redactSecret(error.raw, apiKey) as Record<string, unknown>;
 
   if (error.code === "llm_missing_api_key" || error.code === "llm_invalid_api_key") {
     return new ChatVectorAuthError(message, { details });
@@ -36,8 +50,9 @@ export function mapStreamError(error: StreamErrorPayload): ChatVectorAPIError {
 
 export async function* iterChatStreamEvents(
   response: Response,
-  signal?: AbortSignal,
+  options: StreamParseOptions = {},
 ): AsyncGenerator<ChatStreamEvent> {
+  const { signal, apiKey } = options;
   if (response.body === null) {
     return;
   }
@@ -52,7 +67,7 @@ export async function* iterChatStreamEvents(
     if (eventName === null && dataLines.length === 0) {
       return null;
     }
-    const event = dispatchSseEvent(eventName, dataLines.join("\n"));
+    const event = dispatchSseEvent(eventName, dataLines.join("\n"), apiKey);
     eventName = null;
     dataLines = [];
     return event;
@@ -60,11 +75,9 @@ export async function* iterChatStreamEvents(
 
   try {
     while (true) {
-      if (signal?.aborted) {
-        throw signal.reason ?? new DOMException("The operation was aborted", "AbortError");
-      }
+      throwIfAborted(signal);
 
-      const { done, value } = await reader.read();
+      const { done, value } = await readStreamChunk(reader, signal);
       if (done) {
         break;
       }
@@ -118,44 +131,86 @@ export async function* iterChatStreamEvents(
   }
 }
 
+async function readStreamChunk(
+  reader: ReadableStreamDefaultReader<Uint8Array>,
+  signal?: AbortSignal,
+): Promise<ReadableStreamReadResult<Uint8Array>> {
+  let rejectInterruption: ((reason: unknown) => void) | undefined;
+  const interruption = new Promise<never>((_resolve, reject) => {
+    rejectInterruption = reject;
+  });
+  const onAbort = (): void => {
+    rejectInterruption?.(abortReason(signal!));
+  };
+
+  signal?.addEventListener("abort", onAbort, { once: true });
+  if (signal?.aborted) {
+    onAbort();
+  }
+
+  try {
+    return await Promise.race([reader.read(), interruption]);
+  } catch (error) {
+    try {
+      void reader.cancel().catch(() => undefined);
+    } catch {
+      // The abort reason below remains authoritative for callers.
+    }
+    if (signal?.aborted) {
+      throw abortReason(signal);
+    }
+    throw error;
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+  }
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (signal?.aborted) {
+    throw abortReason(signal);
+  }
+}
+
 function dispatchSseEvent(
   eventName: string | null,
   data: string,
+  apiKey?: string,
 ): ChatStreamEvent | null {
   if (eventName === "done" || data === DONE_PAYLOAD) {
     return null;
   }
 
   if (eventName === "error") {
-    const payload = parseJsonObject(data);
-    throw mapStreamError(parseStreamErrorPayload(payload));
+    const payload = parseJsonObject(data, "error");
+    throw mapStreamError(parseStreamErrorPayload(payload), apiKey);
   }
 
   if (eventName === "token") {
-    const content = JSON.parse(data) as unknown;
+    const content = parseJsonValue(data, "token");
     if (typeof content !== "string") {
       throw new ChatVectorAPIError(
         "ChatVector returned an unexpected token event payload.",
-        { details: content },
+        { details: { event: "token", payload: content } },
       );
     }
     return { type: "token", content };
   }
 
   if (eventName === "complete") {
-    const payload = parseJsonObject(data);
+    const payload = parseJsonObject(data, "complete");
     return {
       type: "complete",
       sessionId: nullableString(payload.session_id),
       sources: mapSources(payload.sources),
       latencyMs: numberValue(payload.latency_ms),
       model: stringValue(payload.model),
+      _raw: payload,
     };
   }
 
   throw new ChatVectorAPIError(
     "ChatVector returned an unexpected streaming event.",
-    { details: { event: eventName, data } },
+    { details: { event: eventName, data: truncateMalformedData(data) } },
   );
 }
 
@@ -167,24 +222,37 @@ function parseStreamErrorPayload(payload: Record<string, unknown>): StreamErrorP
   };
 }
 
-function parseJsonObject(data: string): Record<string, unknown> {
-  let payload: unknown;
-  try {
-    payload = JSON.parse(data) as unknown;
-  } catch {
-    throw new ChatVectorAPIError(
-      "ChatVector returned a non-JSON streaming event payload.",
-      { details: { data } },
-    );
-  }
-
+function parseJsonObject(data: string, eventType: string): Record<string, unknown> {
+  const payload = parseJsonValue(data, eventType);
   if (!isRecord(payload)) {
     throw new ChatVectorAPIError(
       "ChatVector returned an unexpected streaming event payload.",
-      { details: payload },
+      { details: { event: eventType, payload } },
     );
   }
   return payload;
+}
+
+function parseJsonValue(data: string, eventType: string): unknown {
+  try {
+    return JSON.parse(data) as unknown;
+  } catch {
+    throw new ChatVectorAPIError(
+      "ChatVector returned a non-JSON streaming event payload.",
+      {
+        details: {
+          event: eventType,
+          data: truncateMalformedData(data),
+        },
+      },
+    );
+  }
+}
+
+function truncateMalformedData(data: string): string {
+  return data.length <= MAX_MALFORMED_SSE_DATA_CHARS
+    ? data
+    : `${data.slice(0, MAX_MALFORMED_SSE_DATA_CHARS)}…`;
 }
 
 function mapSources(value: unknown): ChatSource[] {

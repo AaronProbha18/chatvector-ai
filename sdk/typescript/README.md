@@ -230,6 +230,7 @@ client.getDocumentStatus(documentId, options?);
 client.waitForReady(documentId, options?);
 
 client.chat(request, options?);
+client.streamChat(request, options?);
 client.batchChat(request, options?);
 
 client.createSession(input?, options?);
@@ -243,8 +244,13 @@ the backend's snake_case JSON contract. Response types include an optional
 `_raw` payload for forward-compatible access to currently unmodeled fields;
 `_raw` is not part of the stable response contract.
 
-Streaming chat, document-status SSE, browser support, pagination helpers, and
-logger/telemetry callbacks are outside v0.
+`streamChat()` is supported in Node and consumes `POST /chat/stream` as typed
+SSE events. Streaming POST requests are never automatically retried. Pass
+`{ signal: AbortSignal }` to cancel an in-flight stream when a downstream
+caller disconnects.
+
+Document-status SSE, browser support, pagination helpers, and logger/telemetry
+callbacks remain outside v0.
 
 ## License
 
