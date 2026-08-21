@@ -16,7 +16,9 @@ from ._common import (
     JSONMapping,
     RETRYABLE_STATUS_CODES,
     build_client_headers,
+    cap_duration_to_deadline,
     default_error_message,
+    encode_path_component,
     extract_error_details,
     is_retryable_method,
     map_http_error,
@@ -24,10 +26,12 @@ from ._common import (
     msg_unexpected,
     normalize_base_url,
     parse_json_dict,
+    remaining_monotonic_seconds,
+    request_timeout_for_deadline,
     retry_after_seconds,
     serialize_batch_query,
 )
-from ._retry import WantsRetry, retry_async
+from ._retry import RetryDeadlineExceeded, WantsRetry, retry_async
 from ._sse import (
     async_iter_stream_chat_events,
     map_stream_error,
@@ -41,10 +45,12 @@ from .models import (
     BatchChatQuery,
     BatchChatResponse,
     ChatResponse,
+    DocumentListResponse,
     DocumentResponse,
     DocumentStatus,
     RetrievalScope,
     Session,
+    SessionHistoryResponse,
     SessionListResponse,
     StreamChatEvent,
 )
@@ -71,10 +77,11 @@ class AsyncChatVectorClient:
         self.api_key = api_key
         self.max_retries = 2
         self.retry_backoff = 0.5
+        self._default_timeout = 30.0
         self._client = httpx.AsyncClient(
             base_url=normalized_base_url,
             headers=headers,
-            timeout=30.0,
+            timeout=self._default_timeout,
             follow_redirects=True,
         )
 
@@ -121,10 +128,30 @@ class AsyncChatVectorClient:
             raise ChatVectorAPIError("Document upload failed for an unknown reason.")
         raise last_error
 
-    async def get_status(self, document_id: str) -> DocumentStatus:
+    async def get_status(
+        self,
+        document_id: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> DocumentStatus:
         """Fetch the ingestion status for a document."""
-        payload = await self._request_json("GET", f"documents/{document_id}/status")
+        encoded_id = encode_path_component(document_id)
+        payload = await self._request_json(
+            "GET",
+            f"documents/{encoded_id}/status",
+            deadline_monotonic=deadline_monotonic,
+        )
         return DocumentStatus.from_dict(payload)
+
+    async def list_documents(self) -> DocumentListResponse:
+        """List document summaries for the authenticated tenant."""
+        payload = await self._request_json("GET", "documents")
+        return DocumentListResponse.from_dict(payload)
+
+    async def delete_document(self, document_id: str) -> None:
+        """Delete a document by identifier."""
+        encoded_id = encode_path_component(document_id)
+        await self._request_no_content("DELETE", f"documents/{encoded_id}")
 
     async def create_session(self, session_id: str | None = None) -> Session:
         """Create a new chat session."""
@@ -136,8 +163,17 @@ class AsyncChatVectorClient:
 
     async def get_session(self, session_id: str) -> Session:
         """Fetch session metadata by identifier."""
-        payload = await self._request_json("GET", f"sessions/{session_id}")
+        payload = await self._request_json(
+            "GET",
+            f"sessions/{encode_path_component(session_id)}",
+        )
         return Session.from_dict(payload)
+
+    async def get_session_history(self, session_id: str) -> SessionHistoryResponse:
+        """Fetch chat message history for a session."""
+        encoded_id = encode_path_component(session_id)
+        payload = await self._request_json("GET", f"sessions/{encoded_id}/history")
+        return SessionHistoryResponse.from_dict(payload)
 
     async def list_sessions(self) -> SessionListResponse:
         """List all sessions for the authenticated tenant."""
@@ -146,7 +182,10 @@ class AsyncChatVectorClient:
 
     async def delete_session(self, session_id: str) -> None:
         """Delete a session by identifier."""
-        await self._request_no_content("DELETE", f"sessions/{session_id}")
+        await self._request_no_content(
+            "DELETE",
+            f"sessions/{encode_path_component(session_id)}",
+        )
 
     async def chat(
         self,
@@ -260,7 +299,15 @@ class AsyncChatVectorClient:
         last_response: DocumentStatus | None = None
 
         while True:
-            last_response = await self.get_status(document_id)
+            if remaining_monotonic_seconds(deadline) == 0.0:
+                raise self._wait_timeout_error(document_id, timeout, last_response)
+            try:
+                last_response = await self.get_status(
+                    document_id,
+                    deadline_monotonic=deadline,
+                )
+            except RetryDeadlineExceeded:
+                raise self._wait_timeout_error(document_id, timeout, last_response) from None
             status = last_response.status
 
             if status == "completed":
@@ -275,37 +322,94 @@ class AsyncChatVectorClient:
                         message = f"{message} {error_message}"
                 raise ChatVectorAPIError(message, details=last_response.to_dict())
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ChatVectorTimeoutError(
-                    f"Timed out after {timeout} second(s) while waiting for document "
-                    f"'{document_id}' to be ready.",
-                    status_code=408,
-                    details=last_response.to_dict(),
-                )
+            remaining = remaining_monotonic_seconds(deadline)
+            if remaining is None or remaining <= 0:
+                raise self._wait_timeout_error(document_id, timeout, last_response)
 
-            await asyncio.sleep(min(interval, remaining))
+            await asyncio.sleep(cap_duration_to_deadline(float(interval), deadline))
 
-    async def _request_json(self, method: str, url: str, **kwargs: Any) -> JSONDict:
+    def _wait_timeout_error(
+        self,
+        document_id: str,
+        timeout: int,
+        last_response: DocumentStatus | None,
+    ) -> ChatVectorTimeoutError:
+        """Build the standard wait-for-ready timeout exception."""
+        details = last_response.to_dict() if last_response is not None else None
+        return ChatVectorTimeoutError(
+            f"Timed out after {timeout} second(s) while waiting for document "
+            f"'{document_id}' to be ready.",
+            status_code=408,
+            details=details,
+        )
+
+    async def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> JSONDict:
         """Send an HTTP request and return the decoded JSON object response."""
-        response = await self._request_response(method, url, **kwargs)
+        response = await self._request_response(
+            method,
+            url,
+            deadline_monotonic=deadline_monotonic,
+            **kwargs,
+        )
         return self._parse_json_dict(response)
 
-    async def _request_no_content(self, method: str, url: str, **kwargs: Any) -> None:
+    async def _request_no_content(
+        self,
+        method: str,
+        url: str,
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Send an HTTP request that returns no response body on success."""
-        await self._request_response(method, url, **kwargs)
+        await self._request_response(
+            method,
+            url,
+            deadline_monotonic=deadline_monotonic,
+            **kwargs,
+        )
 
-    async def _request_response(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    async def _request_response(
+        self,
+        method: str,
+        url: str,
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
         """Send an HTTP request with retry support and return the raw response."""
         max_attempts = self.max_retries + 1
         call_idx = [0]
         retryable_method = is_retryable_method(method)
+        request_kwargs = dict(kwargs)
+        if "timeout" not in request_kwargs:
+            request_kwargs["timeout"] = request_timeout_for_deadline(
+                self._default_timeout,
+                deadline_monotonic,
+            )
 
         async def _attempt() -> httpx.Response:
             i = call_idx[0]
             call_idx[0] += 1
+            if (
+                deadline_monotonic is not None
+                and remaining_monotonic_seconds(deadline_monotonic) == 0.0
+            ):
+                raise RetryDeadlineExceeded()
+            per_attempt_kwargs = dict(request_kwargs)
+            per_attempt_kwargs["timeout"] = request_timeout_for_deadline(
+                float(per_attempt_kwargs.get("timeout", self._default_timeout)),
+                deadline_monotonic,
+            )
             try:
-                response = await self._client.request(method, url, **kwargs)
+                response = await self._client.request(method, url, **per_attempt_kwargs)
                 if response.status_code in self._RETRYABLE_STATUS_CODES:
                     if retryable_method and i + 1 < max_attempts:
                         raise WantsRetry(self._retry_after_seconds(response))
@@ -340,6 +444,7 @@ class AsyncChatVectorClient:
             base_delay=self.retry_backoff,
             backoff=2.0,
             func_name="_request_response",
+            deadline_monotonic=deadline_monotonic,
         )
 
     def _map_http_error(self, response: httpx.Response) -> ChatVectorAPIError:

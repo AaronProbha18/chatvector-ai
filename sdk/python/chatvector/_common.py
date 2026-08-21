@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any, Mapping
+from urllib.parse import quote
 
 import httpx
 
@@ -30,6 +32,39 @@ def is_retryable_method(method: str) -> bool:
     """Only safe, idempotent reads are automatically replayed."""
     normalized = method.upper()
     return normalized in {"GET", "HEAD"}
+
+
+def encode_path_component(value: str) -> str:
+    """Encode one URL path segment (TypeScript ``encodeURIComponent`` semantics)."""
+    return quote(value, safe="")
+
+
+def remaining_monotonic_seconds(deadline_monotonic: float | None) -> float | None:
+    """Return seconds until ``deadline_monotonic``, or ``None`` when unset."""
+    if deadline_monotonic is None:
+        return None
+    return max(0.0, deadline_monotonic - time.monotonic())
+
+
+def cap_duration_to_deadline(duration: float, deadline_monotonic: float | None) -> float:
+    """Cap a sleep or request timeout to the remaining wall-clock budget."""
+    remaining = remaining_monotonic_seconds(deadline_monotonic)
+    if remaining is None:
+        return duration
+    return min(duration, remaining)
+
+
+def request_timeout_for_deadline(
+    default_timeout: float,
+    deadline_monotonic: float | None,
+) -> float:
+    """Choose an httpx timeout that respects an optional absolute deadline."""
+    remaining = remaining_monotonic_seconds(deadline_monotonic)
+    if remaining is None:
+        return default_timeout
+    if remaining <= 0:
+        return 0.001
+    return min(default_timeout, remaining)
 
 
 def map_http_error(response: httpx.Response) -> ChatVectorAPIError:

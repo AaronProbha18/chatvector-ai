@@ -771,6 +771,127 @@ class ChatVectorClientTests(unittest.TestCase):
         self.assertEqual(exc_info.exception.status_code, 422)
         self.assertIsInstance(exc_info.exception.details, list)
 
+    def test_chat_response_surfaces_soft_error_fields(self) -> None:
+        """HTTP 200 chat errors must not look like successful empty answers."""
+        response = make_response(
+            200,
+            method="POST",
+            url="https://api.chatvector.test/chat",
+            json_data={
+                "question": "What is available?",
+                "doc_id": "doc-123",
+                "chunks": 0,
+                "answer": "",
+                "sources": [],
+                "status": "error",
+                "error": {
+                    "code": "no_documents_in_scope",
+                    "message": "No documents available for retrieval in the requested scope.",
+                },
+                "latency_ms": 0,
+                "model": "",
+            },
+        )
+
+        with patch.object(self.client._client, "request", return_value=response):
+            result = self.client.chat("What is available?", "doc-123", scope="session")
+
+        self.assertEqual(result.status, "error")
+        self.assertEqual(result.doc_id, "doc-123")
+        self.assertEqual(result.error["code"], "no_documents_in_scope")
+        self.assertEqual(result.answer, "")
+
+    def test_batch_result_preserves_session_id_from_backend(self) -> None:
+        """Batch items must retain session_id returned by the API."""
+        response = make_response(
+            200,
+            method="POST",
+            url="https://api.chatvector.test/chat/batch",
+            json_data={
+                "count": 1,
+                "success_count": 1,
+                "failure_count": 0,
+                "results": [
+                    {
+                        "status": "ok",
+                        "question": "Summarize it.",
+                        "doc_ids": ["doc-123"],
+                        "chunks": 1,
+                        "answer": "Summary",
+                        "sources": [],
+                        "session_id": "sess-auto-1",
+                    }
+                ],
+            },
+        )
+
+        with patch.object(self.client._client, "request", return_value=response):
+            batch = self.client.batch_chat(
+                [BatchChatQuery(question="Summarize it.", doc_ids=["doc-123"])]
+            )
+
+        self.assertEqual(batch.results[0].session_id, "sess-auto-1")
+
+    def test_list_documents_returns_typed_response(self) -> None:
+        response = make_response(
+            200,
+            url="https://api.chatvector.test/documents",
+            json_data={
+                "tenant_id": "tenant-1",
+                "documents": [
+                    {
+                        "document_id": "doc-123",
+                        "file_name": "guide.pdf",
+                        "status": "completed",
+                        "created_at": "2026-01-01T00:00:00",
+                        "updated_at": "2026-01-02T00:00:00",
+                    }
+                ],
+            },
+        )
+
+        with patch.object(self.client._client, "request", return_value=response):
+            result = self.client.list_documents()
+
+        self.assertEqual(result.tenant_id, "tenant-1")
+        self.assertEqual(len(result.documents), 1)
+        self.assertEqual(result.documents[0].file_name, "guide.pdf")
+
+    def test_delete_document_sends_delete_request(self) -> None:
+        response = make_response(
+            204,
+            method="DELETE",
+            url="https://api.chatvector.test/documents/doc-123",
+        )
+
+        with patch.object(self.client._client, "request", return_value=response) as mock_request:
+            self.client.delete_document("doc-123")
+
+        self.assertEqual(mock_request.call_args.args[:2], ("DELETE", "documents/doc-123"))
+
+    def test_get_session_history_returns_typed_messages(self) -> None:
+        response = make_response(
+            200,
+            url="https://api.chatvector.test/sessions/sess-1/history",
+            json_data={
+                "messages": [
+                    {
+                        "id": "msg-1",
+                        "role": "user",
+                        "content": "Hello",
+                        "created_at": "2026-01-01T00:00:00",
+                    }
+                ]
+            },
+        )
+
+        with patch.object(self.client._client, "request", return_value=response):
+            history = self.client.get_session_history("sess-1")
+
+        self.assertEqual(len(history.messages), 1)
+        self.assertEqual(history.messages[0].role, "user")
+        self.assertEqual(history.messages[0].content, "Hello")
+
 
 if __name__ == "__main__":
     unittest.main()

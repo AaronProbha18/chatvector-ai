@@ -13,11 +13,17 @@ from ._common import (
     DEFAULT_SDK_BASE_DELAY,
     DEFAULT_SDK_MAX_DELAY,
     DEFAULT_SDK_MAX_RETRIES,
+    cap_duration_to_deadline,
+    remaining_monotonic_seconds,
 )
 
 logger = logging.getLogger(__name__)
 
 T = TypeVar("T")
+
+
+class RetryDeadlineExceeded(Exception):
+    """Raised when a retry loop would exceed the caller's absolute deadline."""
 
 
 class WantsRetry(Exception):
@@ -49,6 +55,7 @@ def retry_sync(
     backoff: float = DEFAULT_SDK_BACKOFF,
     max_delay: float = DEFAULT_SDK_MAX_DELAY,
     func_name: Optional[str] = None,
+    deadline_monotonic: float | None = None,
 ) -> T:
     """
     Retry a synchronous callable with exponential full jitter.
@@ -80,6 +87,11 @@ def retry_sync(
     max_attempts = max_retries + 1
 
     for attempt in range(max_attempts):
+        if (
+            deadline_monotonic is not None
+            and remaining_monotonic_seconds(deadline_monotonic) == 0.0
+        ):
+            raise RetryDeadlineExceeded()
         try:
             return func()
         except WantsRetry as e:
@@ -104,6 +116,11 @@ def retry_sync(
                 max_delay=max_delay,
                 min_additional_delay=float(e.min_additional_delay or 0.0),
             )
+            delay = cap_duration_to_deadline(delay, deadline_monotonic)
+            if deadline_monotonic is not None:
+                remaining = remaining_monotonic_seconds(deadline_monotonic)
+                if remaining is None or remaining <= 0.0 or delay >= remaining:
+                    raise RetryDeadlineExceeded() from e
 
             logger.warning(
                 "Transient error in %s, retrying in %.2fs (attempt %d/%d)",
@@ -134,6 +151,7 @@ async def retry_async(
     backoff: float = DEFAULT_SDK_BACKOFF,
     max_delay: float = DEFAULT_SDK_MAX_DELAY,
     func_name: Optional[str] = None,
+    deadline_monotonic: float | None = None,
 ) -> T:
     """
     Retry an async callable with exponential full jitter.
@@ -165,6 +183,11 @@ async def retry_async(
     max_attempts = max_retries + 1
 
     for attempt in range(max_attempts):
+        if (
+            deadline_monotonic is not None
+            and remaining_monotonic_seconds(deadline_monotonic) == 0.0
+        ):
+            raise RetryDeadlineExceeded()
         try:
             return await func()
         except WantsRetry as e:
@@ -189,6 +212,11 @@ async def retry_async(
                 max_delay=max_delay,
                 min_additional_delay=float(e.min_additional_delay or 0.0),
             )
+            delay = cap_duration_to_deadline(delay, deadline_monotonic)
+            if deadline_monotonic is not None:
+                remaining = remaining_monotonic_seconds(deadline_monotonic)
+                if remaining is None or remaining <= 0.0 or delay >= remaining:
+                    raise RetryDeadlineExceeded() from e
 
             logger.warning(
                 "Transient error in %s, retrying in %.2fs (attempt %d/%d)",

@@ -260,7 +260,7 @@ Build on the platform foundation to improve response quality and expand develope
 **Inspection and observability tooling**
 
 - Query transformation visualization (opt-in debug metadata beyond current `retrieval_debug` payloads)
-- Ingestion SSE client in Python and TypeScript SDKs (document status stream not exposed in SDKs)
+- Ingestion SSE client in the TypeScript SDK (sync Python `iter_document_status` is available)
 - Per-component citation score fields on SDK `ChatSource` models (API already returns them)
 
 ---

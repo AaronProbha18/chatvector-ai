@@ -10,7 +10,7 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
-from ._retry import WantsRetry, retry_sync
+from ._retry import RetryDeadlineExceeded, WantsRetry, retry_sync
 from ._sse import (
     iter_document_status_events,
     iter_stream_chat_events,
@@ -28,10 +28,12 @@ from .models import (
     BatchChatQuery,
     BatchChatResponse,
     ChatResponse,
+    DocumentListResponse,
     DocumentResponse,
     DocumentStatus,
     RetrievalScope,
     Session,
+    SessionHistoryResponse,
     SessionListResponse,
     StreamChatEvent,
 )
@@ -39,7 +41,9 @@ from ._common import (
     JSONDict,
     JSONMapping,
     RETRYABLE_STATUS_CODES,
+    cap_duration_to_deadline,
     default_error_message,
+    encode_path_component,
     extract_error_details,
     is_retryable_method,
     map_http_error,
@@ -47,6 +51,8 @@ from ._common import (
     msg_unexpected,
     normalize_base_url,
     parse_json_dict,
+    remaining_monotonic_seconds,
+    request_timeout_for_deadline,
     retry_after_seconds,
     serialize_batch_query,
     build_client_headers,
@@ -77,10 +83,11 @@ class ChatVectorClient:
         self.api_key = api_key
         self.max_retries = 2
         self.retry_backoff = 0.5
+        self._default_timeout = 30.0
         self._client = httpx.Client(
             base_url=normalized_base_url,
             headers=headers,
-            timeout=30.0,
+            timeout=self._default_timeout,
             follow_redirects=True,
         )
 
@@ -137,18 +144,49 @@ class ChatVectorClient:
             raise ChatVectorAPIError("Document upload failed for an unknown reason.")
         raise last_error
 
-    def get_status(self, document_id: str) -> DocumentStatus:
+    def get_status(
+        self,
+        document_id: str,
+        *,
+        deadline_monotonic: float | None = None,
+    ) -> DocumentStatus:
         """
         Fetch the ingestion status for a document.
 
         Args:
             document_id: The document identifier returned by ``upload_document``.
+            deadline_monotonic: Optional absolute poll deadline for internal use.
 
         Returns:
             A typed document status response.
         """
-        payload = self._request_json("GET", f"documents/{document_id}/status")
+        encoded_id = encode_path_component(document_id)
+        payload = self._request_json(
+            "GET",
+            f"documents/{encoded_id}/status",
+            deadline_monotonic=deadline_monotonic,
+        )
         return DocumentStatus.from_dict(payload)
+
+    def list_documents(self) -> DocumentListResponse:
+        """
+        List document summaries for the authenticated tenant.
+
+        Returns:
+            A typed list of tenant document summaries.
+        """
+        payload = self._request_json("GET", "documents")
+        return DocumentListResponse.from_dict(payload)
+
+    def delete_document(self, document_id: str) -> None:
+        """
+        Delete a document by identifier.
+
+        Args:
+            document_id: Document identifier to delete.
+        """
+        encoded_id = encode_path_component(document_id)
+        self._request_no_content("DELETE", f"documents/{encoded_id}")
 
     def create_session(self, session_id: str | None = None) -> Session:
         """
@@ -176,8 +214,22 @@ class ChatVectorClient:
         Returns:
             A typed session response.
         """
-        payload = self._request_json("GET", f"sessions/{session_id}")
+        payload = self._request_json("GET", f"sessions/{encode_path_component(session_id)}")
         return Session.from_dict(payload)
+
+    def get_session_history(self, session_id: str) -> SessionHistoryResponse:
+        """
+        Fetch chat message history for a session.
+
+        Args:
+            session_id: Session identifier to retrieve history for.
+
+        Returns:
+            A typed session history response.
+        """
+        encoded_id = encode_path_component(session_id)
+        payload = self._request_json("GET", f"sessions/{encoded_id}/history")
+        return SessionHistoryResponse.from_dict(payload)
 
     def list_sessions(self) -> SessionListResponse:
         """
@@ -196,7 +248,7 @@ class ChatVectorClient:
         Args:
             session_id: Session identifier to delete.
         """
-        self._request_no_content("DELETE", f"sessions/{session_id}")
+        self._request_no_content("DELETE", f"sessions/{encode_path_component(session_id)}")
 
     def chat(
         self,
@@ -349,7 +401,8 @@ class ChatVectorClient:
         if timeout is not None:
             request_kwargs["timeout"] = timeout
 
-        return self._iter_document_status_events(document_id, request_kwargs)
+        encoded_id = encode_path_component(document_id)
+        return self._iter_document_status_events(encoded_id, request_kwargs)
 
     def _iter_document_status_events(
         self,
@@ -413,7 +466,12 @@ class ChatVectorClient:
         last_response: DocumentStatus | None = None
 
         while True:
-            last_response = self.get_status(document_id)
+            if remaining_monotonic_seconds(deadline) == 0.0:
+                raise self._wait_timeout_error(document_id, timeout, last_response)
+            try:
+                last_response = self.get_status(document_id, deadline_monotonic=deadline)
+            except RetryDeadlineExceeded:
+                raise self._wait_timeout_error(document_id, timeout, last_response) from None
             status = last_response.status
 
             if status == "completed":
@@ -428,18 +486,35 @@ class ChatVectorClient:
                         message = f"{message} {error_message}"
                 raise ChatVectorAPIError(message, details=last_response.to_dict())
 
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                raise ChatVectorTimeoutError(
-                    f"Timed out after {timeout} second(s) while waiting for document "
-                    f"'{document_id}' to be ready.",
-                    status_code=408,
-                    details=last_response.to_dict(),
-                )
+            remaining = remaining_monotonic_seconds(deadline)
+            if remaining is None or remaining <= 0:
+                raise self._wait_timeout_error(document_id, timeout, last_response)
 
-            time.sleep(min(interval, remaining))
+            time.sleep(cap_duration_to_deadline(float(interval), deadline))
 
-    def _request_json(self, method: str, url: str, **kwargs: Any) -> JSONDict:
+    def _wait_timeout_error(
+        self,
+        document_id: str,
+        timeout: int,
+        last_response: DocumentStatus | None,
+    ) -> ChatVectorTimeoutError:
+        """Build the standard wait-for-ready timeout exception."""
+        details = last_response.to_dict() if last_response is not None else None
+        return ChatVectorTimeoutError(
+            f"Timed out after {timeout} second(s) while waiting for document "
+            f"'{document_id}' to be ready.",
+            status_code=408,
+            details=details,
+        )
+
+    def _request_json(
+        self,
+        method: str,
+        url: str,
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> JSONDict:
         """
         Send an HTTP request and return the decoded JSON object response.
 
@@ -454,10 +529,22 @@ class ChatVectorClient:
         Raises:
             ChatVectorAPIError: If the API or network request fails.
         """
-        response = self._request_response(method, url, **kwargs)
+        response = self._request_response(
+            method,
+            url,
+            deadline_monotonic=deadline_monotonic,
+            **kwargs,
+        )
         return self._parse_json_dict(response)
 
-    def _request_no_content(self, method: str, url: str, **kwargs: Any) -> None:
+    def _request_no_content(
+        self,
+        method: str,
+        url: str,
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> None:
         """
         Send an HTTP request that returns no response body on success.
 
@@ -469,9 +556,21 @@ class ChatVectorClient:
         Raises:
             ChatVectorAPIError: If the API or network request fails.
         """
-        self._request_response(method, url, **kwargs)
+        self._request_response(
+            method,
+            url,
+            deadline_monotonic=deadline_monotonic,
+            **kwargs,
+        )
 
-    def _request_response(self, method: str, url: str, **kwargs: Any) -> httpx.Response:
+    def _request_response(
+        self,
+        method: str,
+        url: str,
+        *,
+        deadline_monotonic: float | None = None,
+        **kwargs: Any,
+    ) -> httpx.Response:
         """
         Send an HTTP request with retry support and return the raw response.
 
@@ -489,12 +588,28 @@ class ChatVectorClient:
         max_attempts = self.max_retries + 1
         call_idx = [0]
         retryable_method = is_retryable_method(method)
+        request_kwargs = dict(kwargs)
+        if "timeout" not in request_kwargs:
+            request_kwargs["timeout"] = request_timeout_for_deadline(
+                self._default_timeout,
+                deadline_monotonic,
+            )
 
         def _attempt() -> httpx.Response:
             i = call_idx[0]
             call_idx[0] += 1
+            if (
+                deadline_monotonic is not None
+                and remaining_monotonic_seconds(deadline_monotonic) == 0.0
+            ):
+                raise RetryDeadlineExceeded()
+            per_attempt_kwargs = dict(request_kwargs)
+            per_attempt_kwargs["timeout"] = request_timeout_for_deadline(
+                float(per_attempt_kwargs.get("timeout", self._default_timeout)),
+                deadline_monotonic,
+            )
             try:
-                response = self._client.request(method, url, **kwargs)
+                response = self._client.request(method, url, **per_attempt_kwargs)
                 if response.status_code in self._RETRYABLE_STATUS_CODES:
                     if retryable_method and i + 1 < max_attempts:
                         raise WantsRetry(self._retry_after_seconds(response))
@@ -529,6 +644,7 @@ class ChatVectorClient:
             base_delay=self.retry_backoff,
             backoff=2.0,
             func_name="_request_response",
+            deadline_monotonic=deadline_monotonic,
         )
 
     def _map_http_error(self, response: httpx.Response) -> ChatVectorAPIError:

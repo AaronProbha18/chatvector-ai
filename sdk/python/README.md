@@ -213,8 +213,8 @@ from chatvector import ChatVectorClient, BatchChatQuery
 with ChatVectorClient(base_url="http://localhost:8000", api_key="cv_live_...") as client:
     result = client.batch_chat(
         queries=[
-            BatchChatQuery(question="Key risks?", doc_id="doc-1"),
-            BatchChatQuery(question="Revenue drivers?", doc_id="doc-2"),
+            BatchChatQuery(question="Key risks?", doc_ids=["doc-1"]),
+            BatchChatQuery(question="Revenue drivers?", doc_ids=["doc-2"]),
         ],
         session_id="sess-1",
         scope="session",
@@ -281,3 +281,4 @@ The backend currently exposes document upload at `/upload`. The SDK targets `/in
 ## Current Gaps
 
 - **No per-component retrieval scores** — citations expose collapsed `score` + `score_type` only
+- **Async ingestion SSE** — sync ``iter_document_status`` is available; the async client still uses polling via ``wait_for_ready``

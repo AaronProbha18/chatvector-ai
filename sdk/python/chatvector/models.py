@@ -139,9 +139,12 @@ class ChatResponse:
     """Single-document chat response."""
 
     question: str
+    doc_id: str
     chunks: int
     answer: str
+    status: str = "ok"
     sources: list[ChatSource] = field(default_factory=list)
+    error: JSONDict | None = None
     latency_ms: int = 0
     model: str = ""
     session_id: str | None = None
@@ -153,11 +156,16 @@ class ChatResponse:
         raw = dict(payload)
         sources_payload = payload.get("sources")
         sources = _parse_sources(sources_payload)
+        error = payload.get("error")
+        status = str(payload.get("status") or "ok")
         return cls(
             question=str(payload.get("question", "")),
+            doc_id=str(payload.get("doc_id", "")),
             chunks=int(payload.get("chunks", 0)),
             answer=str(payload.get("answer", "")),
+            status=status,
             sources=sources,
+            error=dict(error) if isinstance(error, Mapping) else None,
             latency_ms=int(payload.get("latency_ms") or 0),
             model=str(payload.get("model") or ""),
             session_id=_optional_str(payload.get("session_id")),
@@ -166,17 +174,149 @@ class ChatResponse:
 
     def to_dict(self) -> JSONDict:
         """Convert the model back to a JSON-serializable dictionary."""
-        payload = {
+        payload: JSONDict = {
             "question": self.question,
+            "doc_id": self.doc_id,
             "chunks": self.chunks,
             "answer": self.answer,
+            "status": self.status,
             "sources": [source.to_dict() for source in self.sources],
             "latency_ms": self.latency_ms,
             "model": self.model,
         }
         if self.session_id is not None:
             payload["session_id"] = self.session_id
+        if self.error is not None:
+            payload["error"] = dict(self.error)
         return payload
+
+
+@dataclass(slots=True)
+class DocumentSummary:
+    """One document row returned from ``GET /documents``."""
+
+    document_id: str
+    file_name: str | None
+    status: str
+    created_at: str | None = None
+    updated_at: str | None = None
+    raw: JSONDict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, payload: JSONMapping) -> "DocumentSummary":
+        """Build a document summary from an API response payload."""
+        raw = dict(payload)
+        return cls(
+            document_id=str(payload.get("document_id", "")),
+            file_name=_optional_str(payload.get("file_name")),
+            status=str(payload.get("status", "")),
+            created_at=_optional_str(payload.get("created_at")),
+            updated_at=_optional_str(payload.get("updated_at")),
+            raw=raw,
+        )
+
+    def to_dict(self) -> JSONDict:
+        """Convert the model back to a JSON-serializable dictionary."""
+        payload: JSONDict = {
+            "document_id": self.document_id,
+            "file_name": self.file_name,
+            "status": self.status,
+        }
+        if self.created_at is not None:
+            payload["created_at"] = self.created_at
+        if self.updated_at is not None:
+            payload["updated_at"] = self.updated_at
+        return payload
+
+
+@dataclass(slots=True)
+class DocumentListResponse:
+    """Collection response returned from ``GET /documents``."""
+
+    tenant_id: str
+    documents: list[DocumentSummary] = field(default_factory=list)
+    raw: JSONDict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, payload: JSONMapping) -> "DocumentListResponse":
+        """Build a document list model from an API response payload."""
+        raw = dict(payload)
+        documents_payload = payload.get("documents")
+        documents = [
+            DocumentSummary.from_dict(item)
+            for item in documents_payload
+            if isinstance(item, Mapping)
+        ] if isinstance(documents_payload, list) else []
+        return cls(
+            tenant_id=str(payload.get("tenant_id", "")),
+            documents=documents,
+            raw=raw,
+        )
+
+    def to_dict(self) -> JSONDict:
+        """Convert the model back to a JSON-serializable dictionary."""
+        return {
+            "tenant_id": self.tenant_id,
+            "documents": [document.to_dict() for document in self.documents],
+        }
+
+
+@dataclass(slots=True)
+class SessionHistoryMessage:
+    """One message returned from ``GET /sessions/{id}/history``."""
+
+    id: str
+    role: str
+    content: str
+    created_at: str | None = None
+    raw: JSONDict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, payload: JSONMapping) -> "SessionHistoryMessage":
+        """Build a history message model from an API response payload."""
+        raw = dict(payload)
+        return cls(
+            id=str(payload.get("id", "")),
+            role=str(payload.get("role", "")),
+            content=str(payload.get("content", "")),
+            created_at=_optional_str(payload.get("created_at")),
+            raw=raw,
+        )
+
+    def to_dict(self) -> JSONDict:
+        """Convert the model back to a JSON-serializable dictionary."""
+        payload: JSONDict = {
+            "id": self.id,
+            "role": self.role,
+            "content": self.content,
+        }
+        if self.created_at is not None:
+            payload["created_at"] = self.created_at
+        return payload
+
+
+@dataclass(slots=True)
+class SessionHistoryResponse:
+    """Collection response returned from ``GET /sessions/{id}/history``."""
+
+    messages: list[SessionHistoryMessage] = field(default_factory=list)
+    raw: JSONDict = field(default_factory=dict, repr=False)
+
+    @classmethod
+    def from_dict(cls, payload: JSONMapping) -> "SessionHistoryResponse":
+        """Build a session history model from an API response payload."""
+        raw = dict(payload)
+        messages_payload = payload.get("messages")
+        messages = [
+            SessionHistoryMessage.from_dict(item)
+            for item in messages_payload
+            if isinstance(item, Mapping)
+        ] if isinstance(messages_payload, list) else []
+        return cls(messages=messages, raw=raw)
+
+    def to_dict(self) -> JSONDict:
+        """Convert the model back to a JSON-serializable dictionary."""
+        return {"messages": [message.to_dict() for message in self.messages]}
 
 
 @dataclass(slots=True)
