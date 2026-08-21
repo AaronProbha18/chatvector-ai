@@ -492,10 +492,14 @@ choosing a logging API outside this issue's scope. Application code can observe
 errors and cancellation through returned promises; a structured logger or
 telemetry hook requires a separate SDK design.
 
-## Streaming: rollout phase 2
+## Streaming chat (shipped in v0)
 
-Streaming is explicitly outside v0, but the next issue can use this exact
-shape without redesigning the core client:
+`streamChat()` is part of the v0 Node SDK. It issues `POST /chat/stream` with
+`fetch`, parses `token`, `complete`, and `error` SSE records, ignores the
+legacy `done`/`[DONE]` marker, and maps structured `error` records to the same
+error hierarchy as non-streaming chat. Complete events preserve the decoded
+backend payload on `_raw` for forward-compatible fields such as
+`retrieval_debug`.
 
 ```ts
 type ChatStreamEvent =
@@ -506,16 +510,16 @@ type ChatStreamEvent =
       sources: ChatSource[];
       latencyMs: number;
       model: string;
+      _raw?: Record<string, unknown>;
     };
 
 client.streamChat(request: ChatRequest, options?: RequestOptions): AsyncIterable<ChatStreamEvent>;
 ```
 
-`client.streamChat()` issues `POST /chat/stream` with `fetch`, parses `token`, `complete`, and
-`error` SSE records, ignores the legacy `done`/`[DONE]` marker, and maps
-structured `error` records to the same error hierarchy as Python. It does not
-use browser `EventSource`, because this endpoint requires a POST request and
-authorization header. Never retry a stream once it starts.
+The SDK does not use browser `EventSource`, because this endpoint requires a
+POST request and authorization header. Streaming POST requests are never
+automatically retried once response bytes begin. Caller `AbortSignal` cancels
+in-flight SSE body reads using the same abort semantics as JSON response bodies.
 
 Document-status SSE (`GET /documents/{id}/status/stream`) is not exposed in the
 TypeScript SDK v0; `waitForReady` polling is the supported ingestion-progress API.
