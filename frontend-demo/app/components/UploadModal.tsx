@@ -283,7 +283,7 @@ export default function UploadModal({
                 </button>
               )}
             </div>
-            <p className="mt-1 mb-2 text-base text-muted">PDF, TXT, or DOCX</p>
+            <p className="mt-1 mb-2 text-base text-muted">PDF or TXT</p>
           </div>
           <button
             ref={closeButtonRef}
@@ -322,7 +322,7 @@ export default function UploadModal({
           <input
             ref={inputRef}
             type="file"
-            accept=".pdf,.txt,.docx"
+            accept=".pdf,.txt"
             onChange={handleChange}
             className="hidden"
           />
@@ -460,7 +460,7 @@ export default function UploadModal({
                 Drop a file here or{" "}
                 <span className="font-medium text-accent-text">browse</span>
               </p>
-              <p className="mt-2 text-sm text-subtle">PDF · TXT · DOCX</p>
+              <p className="mt-2 text-sm text-subtle">PDF · TXT</p>
             </>
           )}
         </div>

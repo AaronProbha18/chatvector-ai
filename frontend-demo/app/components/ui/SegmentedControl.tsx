@@ -9,6 +9,7 @@ type Props<T extends string> = {
   value: T;
   onChange: (value: T) => void;
   options: Option<T>[];
+  disabled?: boolean;
 };
 
 /**
@@ -21,21 +22,29 @@ export function SegmentedControl<T extends string>({
   value,
   onChange,
   options,
+  disabled = false,
 }: Props<T>) {
   return (
     <div
-      className="inline-flex rounded-lg border border-border bg-surface p-1"
+      className={`inline-flex rounded-lg border border-border bg-surface p-1 ${
+        disabled ? "opacity-60" : ""
+      }`}
       role="radiogroup"
       aria-label={ariaLabel}
+      aria-disabled={disabled || undefined}
     >
       {options.map((option) => (
-        <label key={option.value} className="cursor-pointer">
+        <label
+          key={option.value}
+          className={disabled ? "cursor-not-allowed" : "cursor-pointer"}
+        >
           <input
             type="radio"
             name={name}
             value={option.value}
             checked={value === option.value}
             onChange={() => onChange(option.value)}
+            disabled={disabled}
             className="sr-only"
           />
           <span

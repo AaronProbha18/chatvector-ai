@@ -28,6 +28,21 @@ describe("UploadModal", () => {
     expect(onClose).toHaveBeenCalledOnce();
   });
 
+  it("accepts only PDF and TXT in the file picker", () => {
+    render(
+      <UploadModal
+        onClose={vi.fn()}
+        onUploadAccepted={vi.fn()}
+        attachment={null}
+      />
+    );
+
+    const fileInput = document.querySelector('input[type="file"]') as HTMLInputElement;
+    expect(fileInput.accept).toBe(".pdf,.txt");
+    expect(screen.getByText("PDF or TXT")).toBeInTheDocument();
+    expect(screen.queryByText(/DOCX/i)).not.toBeInTheDocument();
+  });
+
   it("shows validation error when upload fails", async () => {
     vi.mocked(uploadDocument).mockRejectedValue(new Error("Only PDF files are supported"));
 

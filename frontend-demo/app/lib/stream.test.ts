@@ -56,6 +56,28 @@ describe("parseRawEvent", () => {
       sources: [{ file_name: "doc.pdf", page_number: 1, chunk_index: 0, score: 0.9 }],
       latency_ms: 1200,
       model: "gemini-2.5-flash",
+      _raw: JSON.parse(data),
+    });
+  });
+
+  it("preserves retrieval_debug on complete events via _raw", () => {
+    const payload = {
+      type: "complete",
+      session_id: "sess-1",
+      sources: [],
+      latency_ms: 1200,
+      model: "gemini-2.5-flash",
+      retrieval_debug: { candidates: 8, reranked: true },
+    };
+    const result = parseRawEvent(
+      `event: complete\ndata: ${JSON.stringify(payload)}`,
+    );
+    expect(result).toMatchObject({
+      type: "complete",
+      _raw: payload,
+    });
+    expect(result).toMatchObject({
+      _raw: { retrieval_debug: { candidates: 8, reranked: true } },
     });
   });
 
@@ -101,6 +123,7 @@ describe("parseRawEvent", () => {
       sources: [],
       latency_ms: 100,
       model: "m",
+      _raw: JSON.parse(`${part1}${part2}`),
     });
   });
 
@@ -122,6 +145,7 @@ describe("parseRawEvent", () => {
       sources: [],
       latency_ms: 500,
       model: "test-model",
+      _raw: JSON.parse(data),
     });
     // session_id should NOT be present in the result
     expect(result).not.toHaveProperty("session_id");
@@ -146,7 +170,13 @@ describe("parseSSEStream", () => {
     expect(events).toEqual([
       { type: "token", text: "Hello" },
       { type: "token", text: " world" },
-      { type: "complete", sources: [], latency_ms: 200, model: "m" },
+      {
+        type: "complete",
+        sources: [],
+        latency_ms: 200,
+        model: "m",
+        _raw: { type: "complete", sources: [], latency_ms: 200, model: "m" },
+      },
       { type: "done" },
     ]);
   });

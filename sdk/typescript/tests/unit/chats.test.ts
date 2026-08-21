@@ -201,6 +201,7 @@ describe("batchChat", () => {
       answer: "Summary",
       latencyMs: 123,
       model: "gpt-test",
+      sessionId: "generated-session-kept-in-raw",
     });
     expect(result.results[0]?._raw).toHaveProperty(
       "session_id",

@@ -23,6 +23,8 @@ export type ChatCallOptions = {
   matchCount?: number;
   scope?: RetrievalScope;
   sessionId?: string | null;
+  /** Optional abort signal for cancelling the in-flight request. */
+  signal?: AbortSignal;
 };
 
 export const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? "http://localhost:8000";
@@ -242,8 +244,15 @@ export async function sendMessage(
       method: "POST",
       headers,
       body: JSON.stringify(body),
+      ...(options.signal !== undefined ? { signal: options.signal } : {}),
     });
-  } catch {
+  } catch (e) {
+    if (
+      options.signal?.aborted ||
+      (e instanceof DOMException && e.name === "AbortError")
+    ) {
+      throw e;
+    }
     throw new ChatError(
       "backend_unreachable",
       "Cannot reach the server. Check your connection."

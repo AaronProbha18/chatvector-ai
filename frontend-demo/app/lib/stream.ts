@@ -11,6 +11,8 @@ export type CompleteEvent = {
   latency_ms: number;
   model: string;
   session_id?: string;
+  /** Full backend complete payload, including opt-in fields such as `retrieval_debug`. */
+  _raw?: Record<string, unknown>;
 };
 export type DoneEvent = { type: "done" };
 export type ErrorEvent = { type: "error"; code: string; message: string };
@@ -146,6 +148,7 @@ function parseCompleteEvent(data: string): CompleteEvent | null {
       ...(typeof payload.session_id === "string"
         ? { session_id: payload.session_id }
         : {}),
+      _raw: payload,
     };
   } catch {
     return null;

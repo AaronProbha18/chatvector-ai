@@ -346,6 +346,7 @@ type BatchChatResult = {
   error?: { code: string; message: string };
   latencyMs: number;
   model: string;
+  sessionId?: string | null;
   _raw?: Record<string, unknown>;
 };
 
@@ -479,10 +480,13 @@ type RetryOptions = {
 This retains Python's retryable-status set (`{408, 429, 502, 503, 504}`) but
 improves on the Python backoff formula in two ways: full jitter prevents
 thundering-herd on shared infrastructure, and a `maxDelayMs` cap bounds the
-worst-case wait. The GET/HEAD restriction avoids mutating retry risk until the
-backend introduces an idempotency-key contract. The Python SDK retries all
-HTTP methods including POST, which can duplicate documents, sessions, or
-messages when the server processes the request but the response is lost.
+worst-case wait. Both SDKs restrict automatic replay to `GET` and `HEAD`
+because the backend has no idempotency-key contract; mutating POST operations
+are never automatically replayed.
+
+When a retryable response includes `Retry-After`, Python currently honors
+numeric delta-seconds only. TypeScript also accepts HTTP-date values
+(best-effort).
 
 ## Observability
 
@@ -584,7 +588,7 @@ This section records intentional divergences from the Python
 
 | Area | Python SDK | TypeScript SDK | Rationale |
 | --- | --- | --- | --- |
-| Retry scope | All HTTP methods including POST | GET and HEAD only | No idempotency-key contract; retrying POST could duplicate documents, sessions, or messages |
+| Retry scope | GET and HEAD only | GET and HEAD only | No idempotency-key contract; mutating POST could duplicate documents, sessions, or messages |
 | Backoff formula | `max(base × 2^n, Retry-After)`, no jitter, no cap | `random(0..min(initial × 2^n, maxDelay))` with full jitter and `Retry-After` floor | Jitter prevents thundering herd; cap bounds worst-case wait |
 | `ChatResponse` fields | `question`, `chunks`, `answer`, `sources`, `latency_ms`, `model` | Adds `docId`, `status`, `error` | Backend returns these; callers can distinguish provider soft-errors and correlate responses |
 | `RateLimitError.retryAfterMs` | Not present | Included | Exposes parsed `Retry-After` for informed caller back-pressure |
