@@ -524,8 +524,10 @@ with ChatVectorClient("http://localhost:8000", api_key="cv_live_...") as client:
 
 **Features:**
 - Upload, status polling, `wait_for_ready`, non-streaming chat, batch chat
-- Session management (`create_session`, `list_sessions`, `delete_session`)
+- Session management (`create_session`, `list_sessions`, `delete_session`, `get_session_history`)
+- Document management (`list_documents`, `delete_document`)
 - Streaming chat (`stream_chat`) with typed `token` and `complete` events
+- Sync ingestion SSE (`iter_document_status`) for document status streaming
 - Async client (`AsyncChatVectorClient`) with the same surface as the sync client
 - Retrieval scope options (`session` / `tenant`)
 - Typed dataclass response models with citation `score` and `score_type`
@@ -535,7 +537,7 @@ with ChatVectorClient("http://localhost:8000", api_key="cv_live_...") as client:
   `ChatVectorTimeoutError`, `ChatVectorAPIError`
 - Context manager support
 
-**Current gaps:** no ingestion SSE client (document status stream is HTTP/SSE only); no `GET /documents` list helper; per-component citation scores are returned by the API but not yet modeled on SDK `ChatSource` types.
+**Current gaps:** async ingestion SSE client (sync Python `iter_document_status` is available); per-component citation scores are returned by the API but not yet modeled on SDK `ChatSource` types.
 
 Install: `pip install ./sdk/python` — see [sdk/python/README.md](sdk/python/README.md)
 
