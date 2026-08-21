@@ -41,6 +41,7 @@ from rq import SimpleWorker
 from rq.job import Job as RQJob
 
 from core.config import config, redis_connection_kwargs
+from utils.url_display import safe_url_display
 from services.queue_base import (
     BaseIngestionQueue,
     DLQEntry,
@@ -431,7 +432,7 @@ class RedisIngestionQueue(BaseIngestionQueue):
             "(max_size=%d, redis=%s, spill_dir=%s)",
             config.QUEUE_WORKER_COUNT,
             config.QUEUE_MAX_SIZE,
-            config.REDIS_URL,
+            safe_url_display(config.REDIS_URL),
             config.QUEUE_SPILL_DIR,
         )
 

@@ -49,7 +49,7 @@ One implementation:
 
 `DATABASE_URL` controls the target PostgreSQL instance. Any PostgreSQL host with pgvector enabled is supported: local Docker, managed services (Neon, RDS, Cloud SQL, Supabase Postgres via direct connection string), or self-hosted.
 
-The factory in `backend/db/__init__.py` always returns `SQLAlchemyService`. All DB operations are wrapped with retry logic at the factory layer.
+The factory in `backend/db/__init__.py` always returns `SQLAlchemyService`. Most DB operations are wrapped with selective retry logic at the factory layer; non-idempotent chat/session writes are intentionally excluded. See [DEVELOPMENT.md — Where retries apply](DEVELOPMENT.md#where-retries-apply).
 
 This ensures:
 - No direct DB coupling in business logic
@@ -306,7 +306,7 @@ full cross-surface contract and audit checklist.
 | LLM HTTP client | `LLM_HTTP_TIMEOUT_MS` | SDK/`HttpOptions` timeout (ms) |
 | Redis clients | `REDIS_SOCKET_TIMEOUT_SEC` (default 5s) | `socket_timeout` + `socket_connect_timeout` |
 | SQLAlchemy pool | 30s checkout | `pool_timeout` on engine |
-| Health checks | 10s (embed), 15s (LLM) | `asyncio.wait_for` |
+| Health checks | 10s (embed), 10s (LLM) | `asyncio.wait_for` around single-attempt probes |
 
 ---
 
@@ -333,9 +333,11 @@ All limits are configurable via env vars (`RATE_LIMIT_*`).
 429 responses return `{"detail": {"code": "rate_limited", "message": "..."}}`.
 Rate-limit events are logged with tenant ID and path — raw API keys are never logged.
 
-Storage is in-memory for single-instance deployments. Redis-backed
-rate limit storage across multiple API workers remains planned for a
-future Phase 3 follow-up.
+Storage uses Redis when `REDIS_URL` is configured. With the supported
+single-process production topology (`uvicorn --workers 1`), SlowAPI
+`in_memory_fallback_enabled=True` provides degraded per-process limiting if
+the Redis rate-limit store is temporarily unreachable; ingestion still
+requires Redis via RQ.
 
 ---
 
@@ -420,7 +422,11 @@ exception handler returns `{"detail": {"code": "internal_error", "message": "...
 
 ## Health Checks
 
-`GET /status` reports health for all system components. Requires authentication.
+`GET /health` is a lightweight liveness probe for container orchestration
+(no authentication, no upstream calls). Production Compose uses it for the
+API healthcheck.
+
+`GET /status` reports authenticated diagnostics for system components.
 `metrics.documents_indexed` counts documents for the authenticated tenant only.
 `metrics.document_queue` is an API-instance / shared-worker queue depth metric, not tenant-scoped.
 
@@ -428,14 +434,23 @@ exception handler returns `{"detail": {"code": "internal_error", "message": "...
 | --- | --- | --- |
 | API | Always online if responding | No |
 | Database | Live `SELECT 1` + tenant-scoped document count | No |
-| Embeddings | Test embedding call | Yes (TTL: `HEALTH_CHECK_CACHE_TTL_SECONDS`, default 60s) |
-| LLM | Test generation call | Yes (same TTL) |
+| Embeddings | Single-attempt provider probe | Yes (TTL: `HEALTH_CHECK_CACHE_TTL_SECONDS`, default 60s) |
+| LLM | Single-attempt provider probe | Yes (same TTL) |
+| Redis | Ping (when `QUEUE_BACKEND=redis`) | Yes (same TTL) |
 
-All three checks run concurrently via `asyncio.gather`. Health checks
-never block startup or crash the service.
+Provider health probes use at most **one upstream attempt** per cache refresh
+(`retry_async` with `max_retries=0`) and short timeouts
+(`EMBEDDING_HEALTH_CHECK_TIMEOUT_SEC` / `LLM_HEALTH_CHECK_TIMEOUT_SEC`, default 10s each).
+Normal chat and embedding production paths retain the standard retry policy.
 
-The embedding and LLM checks are cached independently — a failing check
-is still retried after TTL expires. Each result includes `cached` and
+Health error responses expose stable codes only (`timeout`, `rate_limited`,
+`api_key_missing`, `disconnected`, `error`) — never raw exception text or URLs.
+
+All checks run concurrently via `asyncio.gather`. Health checks never block
+startup or crash the service.
+
+The embedding and LLM checks are cached independently — a failing check is
+still retried after TTL expires. Each result includes `cached` and
 `checked_at` fields so operators can distinguish live vs cached results.
 
 ---

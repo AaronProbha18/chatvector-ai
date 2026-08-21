@@ -6,9 +6,12 @@ host="$1"
 shift
 cmd="$@"
 
-echo "Waiting for Postgres at $host:5432..."
+PGUSER="${POSTGRES_USER:-postgres}"
+PGDATABASE="${POSTGRES_DB:-postgres}"
 
-until pg_isready -h "$host" -p 5432 -U "postgres"; do
+echo "Waiting for Postgres at $host:5432 (user=$PGUSER, db=$PGDATABASE)..."
+
+until pg_isready -h "$host" -p 5432 -U "$PGUSER" -d "$PGDATABASE"; do
   sleep 1
 done
 

@@ -141,11 +141,19 @@ class DatabaseService(ABC):
 
     async def list_tenant_documents(self, tenant_id: str) -> list[str]:
         """Return IDs of all documents owned by tenant_id."""
-        return []
+        pass
 
+    @abstractmethod
     async def list_tenant_document_summaries(self, tenant_id: str) -> list[dict]:
         """Return summary metadata for all documents owned by tenant_id."""
-        return []
+        pass
+
+    @abstractmethod
+    async def ping_and_count_tenant_documents(
+        self, tenant_id: str
+    ) -> tuple[bool, int | None]:
+        """Verify DB connectivity and return tenant-scoped document count."""
+        pass
 
     # ── Tenant-scoped chat history ────────────────────────────────────────────
 
@@ -180,4 +188,38 @@ class DatabaseService(ABC):
         limit: int = 20,
     ) -> list[dict]:
         """Retrieve recent chat history for a tenant-owned session."""
+        pass
+
+    # ── Session persistence ───────────────────────────────────────────────────
+
+    @abstractmethod
+    async def create_session_record(self, session_id: str, tenant_id) -> "Session":
+        """Create a new session record."""
+        pass
+
+    @abstractmethod
+    async def get_or_create_session_record(
+        self, session_id: str, tenant_id
+    ) -> "Session | None":
+        """Get or create a session record (conflict-safe)."""
+        pass
+
+    @abstractmethod
+    async def get_session_record(self, session_id: str, tenant_id) -> "Session | None":
+        """Fetch a session record scoped to tenant_id."""
+        pass
+
+    @abstractmethod
+    async def list_session_records(self, tenant_id) -> list:
+        """List session records for a tenant."""
+        pass
+
+    @abstractmethod
+    async def delete_session_record(self, session_id: str, tenant_id) -> bool:
+        """Delete a session record and its chat history."""
+        pass
+
+    @abstractmethod
+    async def add_session_document(self, session_id: str, document_id: str) -> None:
+        """Bind a document to a session (idempotent)."""
         pass

@@ -1,5 +1,6 @@
 from redis.asyncio import Redis
 from core.config import config, redis_connection_kwargs
+from utils.url_display import safe_url_display
 import logging
 
 logger = logging.getLogger(__name__)
@@ -17,7 +18,10 @@ class _LazyRedisClient:
                 decode_responses=True,
                 **redis_connection_kwargs(),
             )
-            logger.info("Redis client initialized at %s", config.REDIS_URL)
+            logger.info(
+                "Redis client initialized at %s",
+                safe_url_display(config.REDIS_URL),
+            )
 
     def __getattr__(self, name):
         self._ensure_client()

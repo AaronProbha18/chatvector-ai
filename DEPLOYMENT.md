@@ -97,18 +97,20 @@ QUEUE_BACKEND=redis
 REDIS_URL=redis://redis:6379/0
 ```
 
-Ensure Redis is reachable from the API process before accepting uploads. Without
-Redis in production, ingestion queue behavior is not supported on the default path.
+Ensure Redis is reachable from the API process before accepting uploads.
+`QUEUE_BACKEND=memory` is rejected when `APP_ENV=production`; production
+requires Redis/RQ ingestion.
 
 ---
 
 ## 4. Bootstrap tenant and API keys
 
-Production does **not** auto-create tenants. Bootstrap once per environment:
+Production does **not** auto-create tenants. Bootstrap once per environment
+using the **same database environment as the running API container**:
 
 ```bash
-cd backend
-python -m backend.cli create-tenant-key --tenant "My Org" --tenant-id my-org
+docker compose -f docker-compose.prod.yml --env-file backend/.env.prod \
+  exec api python -m cli create-tenant-key --tenant "My Org" --tenant-id my-org
 ```
 
 The raw key (`cv_live_…`) is printed **once** and is never stored. Save it
@@ -121,11 +123,16 @@ Authorization: Bearer cv_live_<prefix>.<secret>
 Manage keys after bootstrap:
 
 ```bash
-python -m backend.cli list-tenant-keys --tenant-id my-org
-python -m backend.cli rotate-tenant-key --tenant-id my-org --key-id <key-id>
-python -m backend.cli set-tenant-key-expiry --tenant-id my-org --key-id <key-id> --expires-at "2027-01-01T00:00:00Z"
-python -m backend.cli set-tenant-key-external-user-id --tenant-id my-org --key-id <key-id> --external-user-id user_123
-python -m backend.cli revoke-tenant-key --tenant-id my-org --key-id <key-id>
+docker compose -f docker-compose.prod.yml --env-file backend/.env.prod \
+  exec api python -m cli list-tenant-keys --tenant-id my-org
+docker compose -f docker-compose.prod.yml --env-file backend/.env.prod \
+  exec api python -m cli rotate-tenant-key --tenant-id my-org --key-id <key-id>
+docker compose -f docker-compose.prod.yml --env-file backend/.env.prod \
+  exec api python -m cli set-tenant-key-expiry --tenant-id my-org --key-id <key-id> --expires-at "2027-01-01T00:00:00Z"
+docker compose -f docker-compose.prod.yml --env-file backend/.env.prod \
+  exec api python -m cli set-tenant-key-external-user-id --tenant-id my-org --key-id <key-id> --external-user-id user_123
+docker compose -f docker-compose.prod.yml --env-file backend/.env.prod \
+  exec api python -m cli revoke-tenant-key --tenant-id my-org --key-id <key-id>
 ```
 
 Revoking a key is idempotent.
@@ -139,18 +146,24 @@ Revoking a key is idempotent.
 uses JSON logging, and applies resource limits.
 
 ```bash
-# Option A — Makefile helper (reads env from your shell / project .env)
+# Start production stack (uses backend/.env.prod)
 make prod-up
 
-# Option B — explicit Compose
+# Equivalent explicit Compose
 docker compose -f docker-compose.prod.yml --env-file backend/.env.prod up -d
 ```
 
-Compose expands `${VAR}` from the process environment or a project-root `.env`
-file. If values live only in `backend/.env.prod`, pass `--env-file` or export
-them before starting.
+`make prod-up`, `make prod-down`, and `make prod-build` all pass
+`--env-file backend/.env.prod`. Copy `backend/.env.example` to
+`backend/.env.prod` and configure it before starting.
 
-Health check endpoint: `GET http://localhost:8000/health`
+Health check endpoint (liveness): `GET http://localhost:8000/health`
+
+Authenticated diagnostics: `GET /status` (not a container readiness probe).
+
+Production Postgres is **not** published on host port 5432. Use
+`docker compose -f docker-compose.prod.yml --env-file backend/.env.prod exec db psql ...`
+for direct DB access.
 
 Validate the full authenticated upload → ingest → chat path locally:
 
@@ -179,6 +192,7 @@ Validate the full authenticated upload → ingest → chat path locally:
 | **Re-running `001_init.sql` on existing data** | Data loss | Apply only missing numbered migrations |
 | **No API key bootstrap** | No tenant can authenticate | Run `create-tenant-key` once per environment |
 | **Redis unreachable** | Upload/queue failures; `/status` may show queue metrics unavailable | Verify `REDIS_URL` and Redis health |
+| **`QUEUE_BACKEND=memory` in prod** | Startup validation fails | Set `QUEUE_BACKEND=redis` when `APP_ENV=production` |
 | **Multiple API workers/containers** | Unsupported in Phase 3; stale-doc reconciliation and tenant registry break | Run `--workers 1` and one API container |
 | **pgvector not enabled** | Embedding storage fails | Enable extension on Postgres host |
 | **Expecting `/docs` in prod** | Swagger appears disabled | Use OpenAPI from a dev instance or export schema separately |

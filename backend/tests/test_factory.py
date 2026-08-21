@@ -72,6 +72,15 @@ def test_factory_returns_sqlalchemy_in_production(monkeypatch, reset_db_singleto
     assert isinstance(service, SQLAlchemyService)
 
 
+def test_sqlalchemy_service_requires_database_url(monkeypatch):
+    pytest.importorskip("pgvector")
+    monkeypatch.setattr("db.sqlalchemy_service.config.DATABASE_URL", None)
+    from db.sqlalchemy_service import SQLAlchemyService
+
+    with pytest.raises(ValueError, match="DATABASE_URL is not set"):
+        SQLAlchemyService()
+
+
 @pytest.mark.asyncio
 async def test_factory_caches_service(reset_db_singleton):
     """Should return same instance on subsequent calls."""

@@ -1,14 +1,5 @@
-"""Tests for logging_config.setup_logging() log-file routing.
-
-Locks in the APP_ENV-based routing added in
-https://github.com/chatvector-ai/chatvector-ai/pull/236:
-
-- APP_ENV=test  -> logs/test.log + logs/test_access.log
-- otherwise     -> logs/app.log  + logs/access.log
-
-These tests would have caught the conftest.py default-to-production bug
-that let test output leak into app.log on direct-pytest runs.
-"""
+"""Tests for logging_config.setup_logging() log-file routing."""
+import json
 import logging
 import os
 from logging.handlers import RotatingFileHandler
@@ -101,3 +92,88 @@ def test_setup_logging_routes_to_production_files_when_app_env_is_development(
     )
     assert "test.log" not in root_files
     assert "test_access.log" not in access_files
+
+
+def test_setup_logging_root_has_file_and_stream_handlers(monkeypatch, reset_logging):
+    from logging_config.logging_config import setup_logging
+
+    monkeypatch.setenv("APP_ENV", "development")
+    setup_logging()
+
+    root = logging.getLogger()
+    handler_types = {type(h).__name__ for h in root.handlers}
+    assert "RotatingFileHandler" in handler_types
+    assert "StreamHandler" in handler_types
+
+
+def test_setup_logging_application_record_reaches_console(monkeypatch, reset_logging):
+    import io
+
+    from logging_config.logging_config import setup_logging
+
+    monkeypatch.setenv("APP_ENV", "development")
+    setup_logging()
+
+    root = logging.getLogger()
+    stream_handler = next(
+        h for h in root.handlers if type(h).__name__ == "StreamHandler"
+    )
+    buffer = io.StringIO()
+    stream_handler.stream = buffer
+
+    logging.getLogger("app.test.console").info("console-visible-message")
+    assert "console-visible-message" in buffer.getvalue()
+
+
+def test_setup_logging_uvicorn_does_not_propagate_to_root(monkeypatch, reset_logging):
+    from logging_config.logging_config import setup_logging
+
+    monkeypatch.setenv("APP_ENV", "development")
+    setup_logging()
+
+    uvicorn_logger = logging.getLogger("uvicorn.access")
+    assert uvicorn_logger.propagate is False
+
+
+def test_json_formatter_includes_extra_fields():
+    from logging_config.logging_config import JSONFormatter
+
+    formatter = JSONFormatter()
+    record = logging.LogRecord(
+        name="test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="rate limited",
+        args=(),
+        exc_info=None,
+    )
+    record.request_id = "req-1"
+    record.event = "rate_limited"
+    record.tenant_id = "abc"
+
+    payload = json.loads(formatter.format(record))
+    assert payload["event"] == "rate_limited"
+    assert payload["tenant_id"] == "abc"
+    assert payload["level"] == "INFO"
+
+
+def test_json_formatter_extra_cannot_overwrite_canonical_fields():
+    from logging_config.logging_config import JSONFormatter
+
+    formatter = JSONFormatter()
+    record = logging.LogRecord(
+        name="test",
+        level=logging.INFO,
+        pathname=__file__,
+        lineno=1,
+        msg="real message",
+        args=(),
+        exc_info=None,
+    )
+    record.level = "HACK"
+    record.message = "spoof"
+
+    payload = json.loads(formatter.format(record))
+    assert payload["level"] == "INFO"
+    assert payload["message"] == "real message"

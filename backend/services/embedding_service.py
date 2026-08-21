@@ -44,3 +44,20 @@ async def get_embeddings(texts: list[str]) -> list[list[float]]:
 async def get_embedding(text: str) -> list[float]:
     """Convenience wrapper for single-text embedding."""
     return (await get_embeddings([text]))[0]
+
+
+async def probe_embedding_health(text: str) -> None:
+    """Single-attempt embedding probe for /status (no production retry policy)."""
+    provider = get_embedding_provider()
+
+    async def _embed() -> list[list[float]]:
+        return await provider.embed([text])
+
+    await retry_async(
+        _embed,
+        max_retries=0,
+        base_delay=0,
+        backoff=1.0,
+        timeout=float(config.EMBEDDING_HEALTH_CHECK_TIMEOUT_SEC),
+        func_name="embedding_service.probe_embedding_health",
+    )

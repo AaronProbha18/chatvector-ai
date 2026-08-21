@@ -1,4 +1,4 @@
-"""Tests for migration 009: documents.tenant_id NOT NULL enforcement."""
+"""Tests for migration 012: reconcile documents.tenant_id NOT NULL."""
 
 from __future__ import annotations
 
@@ -9,13 +9,14 @@ from uuid import uuid4
 
 import pytest
 
+MIGRATION_009_FILENAME = "009_documents_tenant_id_not_null.sql"
 MIGRATION_PATH = (
     Path(__file__).resolve().parents[1]
     / "db"
     / "init"
-    / "009_documents_tenant_id_not_null.sql"
+    / "012_documents_tenant_id_not_null_reconcile.sql"
 )
-MIGRATION_FILENAME = "009_documents_tenant_id_not_null.sql"
+MIGRATION_FILENAME = "012_documents_tenant_id_not_null_reconcile.sql"
 
 
 def _executable_sql() -> str:
@@ -46,13 +47,6 @@ def test_migration_aborts_on_null_rows_without_recording_ledger():
     sql = MIGRATION_PATH.read_text(encoding="utf-8")
     assert "tenant_id IS NULL" in sql
     assert "RAISE EXCEPTION" in sql
-    assert "RETURN;" not in sql.replace("RETURNING", "")
-
-
-def test_migration_replaces_set_null_fk_with_cascade():
-    sql = MIGRATION_PATH.read_text(encoding="utf-8")
-    assert "ON DELETE CASCADE" in sql
-    assert "ON DELETE SET NULL" in sql
 
 
 @pytest.fixture
@@ -78,15 +72,15 @@ def postgres_connection():
         connection.close()
 
 
-def test_009_end_to_end_null_rows_abort_then_apply_after_backfill(postgres_connection):
-    """NULL tenant_id must abort 009 without ledger row; backfill then succeeds."""
+def test_012_false_009_ledger_null_rows_fails_without_012_ledger(postgres_connection):
+    """False 009 ledger + NULL rows: 012 fails and does not record itself."""
     psycopg = pytest.importorskip("psycopg")
     conn = postgres_connection
     migration_sql = MIGRATION_PATH.read_text(encoding="utf-8")
 
     conn.autocommit = False
     doc_id: str | None = None
-    tenant_id = f"test-009-{uuid4().hex[:8]}"
+    tenant_id = f"test-012-{uuid4().hex[:8]}"
 
     try:
         with conn.cursor() as cur:
@@ -95,23 +89,30 @@ def test_009_end_to_end_null_rows_abort_then_apply_after_backfill(postgres_conne
                 pytest.skip("schema_migrations is not installed")
 
             cur.execute(
-                "DELETE FROM public.schema_migrations WHERE filename = %s",
-                (MIGRATION_FILENAME,),
+                "DELETE FROM public.schema_migrations WHERE filename IN (%s, %s)",
+                (MIGRATION_009_FILENAME, MIGRATION_FILENAME),
+            )
+            cur.execute(
+                "ALTER TABLE documents ALTER COLUMN tenant_id DROP NOT NULL"
             )
             cur.execute(
                 """
-                SELECT 1 FROM information_schema.columns
-                 WHERE table_schema = 'public'
-                   AND table_name = 'documents'
-                   AND column_name = 'tenant_id'
-                   AND is_nullable = 'YES'
+                ALTER TABLE documents DROP CONSTRAINT IF EXISTS fk_documents_tenant_id
                 """
             )
-            if cur.fetchone() is None:
-                cur.execute(
-                    "ALTER TABLE documents ALTER COLUMN tenant_id DROP NOT NULL"
-                )
-
+            cur.execute(
+                """
+                ALTER TABLE documents
+                    ADD CONSTRAINT fk_documents_tenant_id
+                    FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+                    ON DELETE SET NULL
+                """
+            )
+            cur.execute(
+                "INSERT INTO public.schema_migrations (filename) VALUES (%s) "
+                "ON CONFLICT (filename) DO NOTHING",
+                (MIGRATION_009_FILENAME,),
+            )
             cur.execute(
                 "INSERT INTO tenants (id, name) VALUES (%s, %s) "
                 "ON CONFLICT (id) DO NOTHING",
@@ -121,13 +122,13 @@ def test_009_end_to_end_null_rows_abort_then_apply_after_backfill(postgres_conne
             cur.execute(
                 "INSERT INTO documents (id, file_name, tenant_id, status) "
                 "VALUES (%s, %s, NULL, 'completed')",
-                (doc_id, "orphan-doc.sql"),
+                (doc_id, "orphan-012.sql"),
             )
         conn.commit()
 
         with pytest.raises(
             psycopg.errors.RaiseException,
-            match="009_documents_tenant_id_not_null.sql cannot proceed",
+            match="012_documents_tenant_id_not_null_reconcile.sql cannot proceed",
         ):
             with conn.cursor() as cur:
                 cur.execute(migration_sql)
@@ -140,20 +141,71 @@ def test_009_end_to_end_null_rows_abort_then_apply_after_backfill(postgres_conne
                 (MIGRATION_FILENAME,),
             )
             assert cur.fetchone() is None
+    finally:
+        conn.rollback()
+        if doc_id is not None:
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("DELETE FROM documents WHERE id = %s", (doc_id,))
+                    cur.execute("DELETE FROM tenants WHERE id = %s", (tenant_id,))
+                conn.commit()
+                with conn.cursor() as cur:
+                    cur.execute(migration_sql)
+                conn.commit()
+            except Exception:
+                conn.rollback()
+        conn.autocommit = True
+
+
+def test_012_false_009_ledger_clean_rows_repairs_schema(postgres_connection):
+    """False 009 ledger + clean rows: 012 enforces NOT NULL and records itself."""
+    psycopg = pytest.importorskip("psycopg")
+    conn = postgres_connection
+    migration_sql = MIGRATION_PATH.read_text(encoding="utf-8")
+
+    conn.autocommit = False
+    doc_id: str | None = None
+    tenant_id = f"test-012-clean-{uuid4().hex[:8]}"
+
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT to_regclass('public.schema_migrations')")
+            if cur.fetchone()[0] is None:
+                pytest.skip("schema_migrations is not installed")
 
             cur.execute(
+                "DELETE FROM public.schema_migrations WHERE filename IN (%s, %s)",
+                (MIGRATION_009_FILENAME, MIGRATION_FILENAME),
+            )
+            cur.execute(
+                "ALTER TABLE documents ALTER COLUMN tenant_id DROP NOT NULL"
+            )
+            cur.execute(
+                "ALTER TABLE documents DROP CONSTRAINT IF EXISTS fk_documents_tenant_id"
+            )
+            cur.execute(
                 """
-                SELECT is_nullable FROM information_schema.columns
-                 WHERE table_schema = 'public'
-                   AND table_name = 'documents'
-                   AND column_name = 'tenant_id'
+                ALTER TABLE documents
+                    ADD CONSTRAINT fk_documents_tenant_id
+                    FOREIGN KEY (tenant_id) REFERENCES tenants(id)
+                    ON DELETE SET NULL
                 """
             )
-            assert cur.fetchone()[0] == "YES"
-
             cur.execute(
-                "UPDATE documents SET tenant_id = %s WHERE id = %s",
-                (tenant_id, doc_id),
+                "INSERT INTO public.schema_migrations (filename) VALUES (%s) "
+                "ON CONFLICT (filename) DO NOTHING",
+                (MIGRATION_009_FILENAME,),
+            )
+            cur.execute(
+                "INSERT INTO tenants (id, name) VALUES (%s, %s) "
+                "ON CONFLICT (id) DO NOTHING",
+                (tenant_id, tenant_id),
+            )
+            doc_id = str(uuid4())
+            cur.execute(
+                "INSERT INTO documents (id, file_name, tenant_id, status) "
+                "VALUES (%s, %s, %s, 'completed')",
+                (doc_id, "clean-012.sql", tenant_id),
             )
         conn.commit()
 

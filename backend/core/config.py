@@ -129,8 +129,7 @@ class Settings:
     VOYAGE_API_KEY: str | None = os.getenv("VOYAGE_API_KEY") or None
 
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO").upper()
-    LOG_USE_UTC: bool = os.getenv("LOG_USE_UTC", "false").lower() in ("1", "true", "yes")
-    LOG_FORMAT: str = os.getenv("LOG_FORMAT", "TEXT").upper()  # Add this line - TEXT or JSON
+    LOG_FORMAT: str = os.getenv("LOG_FORMAT", "TEXT").upper()  # TEXT or JSON
     CORS_ORIGINS: list[str] = [
         origin.strip()
         for origin in os.getenv("CORS_ORIGINS", "http://localhost:3000").split(",")
@@ -232,7 +231,7 @@ class Settings:
         1, int(os.getenv("EMBEDDING_HEALTH_CHECK_TIMEOUT_SEC", "10"))
     )
     LLM_HEALTH_CHECK_TIMEOUT_SEC: int = max(
-        1, int(os.getenv("LLM_HEALTH_CHECK_TIMEOUT_SEC", "120"))
+        1, int(os.getenv("LLM_HEALTH_CHECK_TIMEOUT_SEC", "10"))
     )
 
 VALID_QUEUE_BACKENDS = {"memory", "redis"}
@@ -246,8 +245,17 @@ def _validate_queue_backend(backend: str) -> None:
         )
 
 
+def _validate_queue_backend_for_env(app_env: str, backend: str) -> None:
+    _validate_queue_backend(backend)
+    if app_env.lower() == "production" and backend == "memory":
+        raise ValueError(
+            "QUEUE_BACKEND=memory is not supported when APP_ENV=production. "
+            "Set QUEUE_BACKEND=redis and ensure REDIS_URL is reachable."
+        )
+
+
 config = Settings()
-_validate_queue_backend(config.QUEUE_BACKEND)
+_validate_queue_backend_for_env(config.APP_ENV, config.QUEUE_BACKEND)
 
 if config.QUERY_TRANSFORMATION_HISTORY_WINDOW > config.MAX_SESSION_HISTORY_MESSAGES:
     logger.warning(

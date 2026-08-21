@@ -25,6 +25,28 @@ def test_queue_backend_default_production(monkeypatch):
         config = core.config.Settings()
         assert config.QUEUE_BACKEND == "redis"
 
+
+def test_queue_backend_memory_rejected_in_production(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("QUEUE_BACKEND", "memory")
+    with patch("dotenv.load_dotenv"):
+        import core.config
+        with pytest.raises(ValueError, match="QUEUE_BACKEND=memory is not supported"):
+            importlib.reload(core.config)
+    monkeypatch.setenv("APP_ENV", "test")
+    monkeypatch.delenv("QUEUE_BACKEND", raising=False)
+    with patch("dotenv.load_dotenv"):
+        importlib.reload(core.config)
+
+
+def test_queue_backend_memory_allowed_in_development(monkeypatch):
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("QUEUE_BACKEND", "memory")
+    with patch("dotenv.load_dotenv"):
+        import core.config
+        importlib.reload(core.config)
+        assert core.config.config.QUEUE_BACKEND == "memory"
+
 @pytest.mark.asyncio
 async def test_startup_validation_redis_unreachable():
     """Verify that lifespan raises an exception and halts startup if Redis is unreachable when configured."""
