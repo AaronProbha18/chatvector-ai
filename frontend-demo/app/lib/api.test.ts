@@ -261,6 +261,22 @@ describe("sendMessage", () => {
       message: "Server error (500). Please try again.",
     });
   });
+
+  it("passes AbortSignal to fetch and rethrows AbortError without wrapping", async () => {
+    const controller = new AbortController();
+    vi.mocked(globalThis.fetch).mockImplementation((_url, init) => {
+      expect(init).toEqual(
+        expect.objectContaining({ signal: controller.signal }),
+      );
+      return Promise.reject(new DOMException("Aborted", "AbortError"));
+    });
+
+    controller.abort();
+
+    await expect(
+      sendMessage("q", "doc-123", { signal: controller.signal }),
+    ).rejects.toMatchObject({ name: "AbortError" });
+  });
 });
 
 describe("sendBatchMessage", () => {
@@ -490,7 +506,7 @@ describe("uploadDocument", () => {
         JSON.stringify({
           detail: {
             code: "unsupported_file_type",
-            message: "Only PDF, TXT, and DOCX files are supported.",
+            message: "Only PDF and TXT files are supported.",
           },
         }),
         { status: 422 }
@@ -503,11 +519,11 @@ describe("uploadDocument", () => {
 
     await expect(uploadDocument(file)).rejects.toMatchObject({
       name: "BackendApiError",
-      message: "Only PDF, TXT, and DOCX files are supported.",
+      message: "Only PDF and TXT files are supported.",
       httpStatus: 422,
       parsed: {
         code: "unsupported_file_type",
-        message: "Only PDF, TXT, and DOCX files are supported.",
+        message: "Only PDF and TXT files are supported.",
       },
     });
     await expect(uploadDocument(file)).rejects.toBeInstanceOf(BackendApiError);
@@ -863,7 +879,13 @@ describe("sendMessageStream", () => {
     expect(events).toEqual([
       { type: "token", text: "Hello" },
       { type: "token", text: " world" },
-      { type: "complete", sources: [], latency_ms: 200, model: "m" },
+      {
+        type: "complete",
+        sources: [],
+        latency_ms: 200,
+        model: "m",
+        _raw: { type: "complete", sources: [], latency_ms: 200, model: "m" },
+      },
       { type: "done" },
     ]);
   });

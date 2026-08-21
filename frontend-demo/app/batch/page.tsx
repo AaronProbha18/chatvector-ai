@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { Layers, Loader2, FileText } from "lucide-react";
 import {
   sendBatchMessage,
@@ -9,6 +9,12 @@ import {
   ChatError,
   type BatchResultItem,
 } from "../lib/api";
+import { apiErrorMessage } from "../lib/apiErrorMessage";
+import {
+  batchSelectionLimit,
+  batchSelectionWithinLimit,
+  canAddBatchSelection,
+} from "../lib/batchLimits";
 import { BatchResultCard } from "../components/batch/BatchResultCard";
 import BatchPageSkeleton from "../components/batch/BatchPageSkeleton";
 import RetrievalSettingsPanel from "../components/RetrievalSettingsPanel";
@@ -26,6 +32,12 @@ type BatchDocument = {
 };
 
 type BatchMode = "compare" | "synthesize";
+
+type ActiveBatchRequest = {
+  mode: BatchMode;
+  docIds: string[];
+  question: string;
+};
 
 const BATCH_MODE_OPTIONS: { value: BatchMode; label: string }[] = [
   { value: "compare", label: "Compare" },
@@ -48,6 +60,10 @@ export default function BatchPage() {
     success: number;
     failure: number;
   } | null>(null);
+  const [activeRequest, setActiveRequest] = useState<ActiveBatchRequest | null>(
+    null,
+  );
+  const inflightRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -69,9 +85,10 @@ export default function BatchPage() {
         if (cancelled) return;
         setDocuments([]);
         setDocumentsError(
-          err instanceof ChatError
-            ? err.message
-            : "Could not load documents. Check your connection and try again."
+          apiErrorMessage(
+            err,
+            "Could not load documents. Check your connection and try again.",
+          ),
         );
       } finally {
         if (!cancelled) {
@@ -97,39 +114,62 @@ export default function BatchPage() {
     [documents, selected]
   );
 
+  const selectionLimit = batchSelectionLimit(mode);
+  const selectionLimitReached = selected.size >= selectionLimit;
+
   const synthesizeTitle = useMemo(() => {
-    if (selectedDocIds.length === 1) {
-      const docId = selectedDocIds[0];
+    const docIds = activeRequest?.docIds ?? selectedDocIds;
+    if (docIds.length === 1) {
+      const docId = docIds[0];
       return nameById.get(docId) ?? docId;
     }
-    return `Across ${selectedDocIds.length} documents`;
-  }, [selectedDocIds, nameById]);
+    return `Across ${docIds.length} documents`;
+  }, [activeRequest?.docIds, selectedDocIds, nameById]);
 
   const toggle = (documentId: string) => {
+    if (inflight) return;
     setSelected((prev) => {
       const next = new Set(prev);
-      if (next.has(documentId)) next.delete(documentId);
-      else next.add(documentId);
+      if (next.has(documentId)) {
+        next.delete(documentId);
+        return next;
+      }
+      if (!canAddBatchSelection(mode, next.size)) {
+        return prev;
+      }
+      next.add(documentId);
       return next;
     });
   };
 
-  const canSubmit = question.trim().length > 0 && selected.size > 0 && !inflight;
+  const canSubmit =
+    question.trim().length > 0 &&
+    batchSelectionWithinLimit(mode, selected.size) &&
+    !inflight;
 
   const handleSubmit = async () => {
-    if (!canSubmit) return;
+    if (!canSubmit || inflightRef.current) return;
+
+    const request: ActiveBatchRequest = {
+      mode,
+      docIds: selectedDocIds,
+      question: question.trim(),
+    };
+
+    inflightRef.current = true;
+    setActiveRequest(request);
     setError(null);
     setResults(null);
     setSummary(null);
     setInflight(true);
     try {
       const response =
-        mode === "compare"
-          ? await sendBatchMessage(question.trim(), selectedDocIds, {
+        request.mode === "compare"
+          ? await sendBatchMessage(request.question, request.docIds, {
               matchCount: settings.matchCount,
               scope: "session",
             })
-          : await sendSynthesizedBatchMessage(question.trim(), selectedDocIds, {
+          : await sendSynthesizedBatchMessage(request.question, request.docIds, {
               matchCount: settings.matchCount,
               scope: "session",
             });
@@ -141,12 +181,16 @@ export default function BatchPage() {
       });
     } catch (e) {
       setError(
-        e instanceof ChatError ? e.message : "Something went wrong. Please try again."
+        apiErrorMessage(e, "Something went wrong. Please try again."),
       );
     } finally {
+      inflightRef.current = false;
       setInflight(false);
     }
   };
+
+  const renderMode = activeRequest?.mode ?? mode;
+  const renderDocIds = activeRequest?.docIds ?? selectedDocIds;
 
   return (
     <div
@@ -190,13 +234,15 @@ export default function BatchPage() {
                   sends one query per document and shows a separate answer card for
                   each — useful for seeing what each file contributes. Each document
                   is answered independently from its own retrieved content; prior
-                  chat or batch turns in this session are not used.
+                  chat or batch turns in this session are not used. Up to{" "}
+                  {batchSelectionLimit("compare")} documents per batch.
                 </p>
                 <p className="mt-3">
                   <strong className="font-medium text-foreground/80">Synthesize</strong>{" "}
                   sends one query across all selected documents and returns a single
                   combined answer with citations from every contributing file — best
-                  for cross-document questions.
+                  for cross-document questions. Up to{" "}
+                  {batchSelectionLimit("synthesize")} documents per query.
                 </p>
               </InfoPopover>
             </div>
@@ -206,6 +252,7 @@ export default function BatchPage() {
               value={mode}
               onChange={setMode}
               options={BATCH_MODE_OPTIONS}
+              disabled={inflight}
             />
           </div>
 
@@ -221,12 +268,13 @@ export default function BatchPage() {
               value={question}
               onChange={(e) => setQuestion(e.target.value)}
               rows={3}
+              disabled={inflight}
               placeholder={
                 mode === "synthesize"
                   ? "e.g. What's the expense process for visiting Apex Manufacturing, and are there known dashboard bugs?"
                   : "e.g. What are the key takeaways?"
               }
-              className="w-full resize-y rounded-lg border border-border bg-surface px-4 py-3 text-base text-foreground outline-none focus:border-accent"
+              className="w-full resize-y rounded-lg border border-border bg-surface px-4 py-3 text-base text-foreground outline-none focus:border-accent disabled:opacity-50"
             />
           </div>
 
@@ -234,17 +282,32 @@ export default function BatchPage() {
             <p className="mb-2 text-sm font-medium">
               Documents{" "}
               <span className="font-normal text-muted">
-                ({selected.size} selected)
+                ({selected.size} selected · limit {selectionLimit})
               </span>
             </p>
+            {selectionLimitReached && (
+              <p className="mb-2 text-xs text-amber-400">
+                {mode === "compare"
+                  ? `Compare mode supports up to ${selectionLimit} documents per batch.`
+                  : `Synthesize mode supports up to ${selectionLimit} documents per query.`}
+              </p>
+            )}
             <ul className="flex flex-col gap-2">
               {documents.map((doc) => (
                 <li key={doc.documentId}>
-                  <label className="flex cursor-pointer items-center gap-3 rounded-lg border border-border bg-surface px-4 py-3 transition-colors hover:border-accent">
+                  <label
+                    className={`flex items-center gap-3 rounded-lg border border-border bg-surface px-4 py-3 transition-colors hover:border-accent ${
+                      inflight ? "cursor-not-allowed opacity-60" : "cursor-pointer"
+                    }`}
+                  >
                     <input
                       type="checkbox"
                       checked={selected.has(doc.documentId)}
                       onChange={() => toggle(doc.documentId)}
+                      disabled={
+                        inflight ||
+                        (!selected.has(doc.documentId) && selectionLimitReached)
+                      }
                       className="h-4 w-4 accent-[color:var(--accent)]"
                     />
                     <FileText size={16} className="shrink-0 text-muted" />
@@ -287,7 +350,7 @@ export default function BatchPage() {
 
           {error && <InlineAlert>{error}</InlineAlert>}
 
-          {summary && mode === "compare" && (
+          {summary && renderMode === "compare" && (
             <div className="flex flex-wrap gap-4 rounded-lg border border-border bg-surface px-4 py-3 text-sm">
               <span>
                 <strong>{summary.count}</strong> total
@@ -302,21 +365,21 @@ export default function BatchPage() {
           )}
 
           <div aria-busy={inflight}>
-            {inflight && mode === "synthesize" && <BatchResultSkeleton />}
+            {inflight && renderMode === "synthesize" && <BatchResultSkeleton />}
 
-            {inflight && mode === "compare" && (
+            {inflight && renderMode === "compare" && (
               <div className="grid gap-4 md:grid-cols-2">
-                {Array.from({ length: selectedDocIds.length }).map((_, index) => (
+                {Array.from({ length: renderDocIds.length }).map((_, index) => (
                   <BatchResultSkeleton key={index} />
                 ))}
               </div>
             )}
 
-            {!inflight && results && mode === "synthesize" && results[0] && (
+            {!inflight && results && renderMode === "synthesize" && results[0] && (
               <BatchResultCard result={results[0]} title={synthesizeTitle} />
             )}
 
-            {!inflight && results && mode === "compare" && (
+            {!inflight && results && renderMode === "compare" && (
               <div className="grid gap-4 md:grid-cols-2">
                 {results.map((result, index) => {
                   const docId = result.doc_ids[0];

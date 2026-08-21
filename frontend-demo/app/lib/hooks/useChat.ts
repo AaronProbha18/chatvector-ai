@@ -50,6 +50,20 @@ function mapApiStatusToAttachmentStatus(apiStatus: string): AttachmentState["sta
   return "processing";
 }
 
+function retrievalDebugFromCompleteRaw(
+  raw: Record<string, unknown> | undefined,
+): Message["retrieval_debug"] | undefined {
+  const value = raw?.retrieval_debug;
+  if (value != null && typeof value === "object" && !Array.isArray(value)) {
+    return value as Message["retrieval_debug"];
+  }
+  return undefined;
+}
+
+function isAbortError(error: unknown): boolean {
+  return error instanceof DOMException && error.name === "AbortError";
+}
+
 async function restoreSessionAttachment(
   documentId: string
 ): Promise<{ attachment: AttachmentState | null; notice: string | null }> {
@@ -82,6 +96,8 @@ async function restoreSessionAttachment(
   }
 }
 
+type ResetTurnMode = "stop" | "session" | "unmount";
+
 export function useChat(sessionId: string | null, retrievalSettings: RetrievalSettings) {
   const [messages, setMessages] = useState<Message[]>(welcomeMessages);
   const [historyLoading, setHistoryLoading] = useState(false);
@@ -94,25 +110,84 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
   const bottomRef = useRef<HTMLDivElement>(null);
   const readyAnnouncedForDocRef = useRef<string | null>(null);
   const historyRequestRef = useRef(0);
+  const chatEpochRef = useRef(0);
   const inflightRef = useRef(false);
   const streamingRef = useRef(false);
-
-  // AbortController for cancelling an in-flight stream.
   const abortControllerRef = useRef<AbortController | null>(null);
-
-  useEffect(() => {
-    inflightRef.current = inflight;
-  }, [inflight]);
-
-  useEffect(() => {
-    streamingRef.current = streaming;
-  }, [streaming]);
-
-  // Token batching: accumulate tokens between animation frames to avoid
-  // excessive React re-renders when the LLM sends tokens very rapidly.
   const pendingTokensRef = useRef<string>("");
   const rafIdRef = useRef<number | null>(null);
   const streamingMsgIdRef = useRef<number | null>(null);
+  const tokenFlushEpochRef = useRef<number | null>(null);
+
+  const resetTurn = useCallback((mode: ResetTurnMode) => {
+    abortControllerRef.current?.abort();
+    abortControllerRef.current = null;
+
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
+    }
+
+    if (mode === "stop" && streamingMsgIdRef.current !== null) {
+      const msgId = streamingMsgIdRef.current;
+      const remaining = pendingTokensRef.current;
+      pendingTokensRef.current = "";
+      tokenFlushEpochRef.current = null;
+      setMessages((prev) =>
+        prev.map((m) =>
+          m.id === msgId
+            ? { ...m, text: m.text + remaining, isStreaming: false }
+            : m
+        )
+      );
+      streamingMsgIdRef.current = null;
+    } else {
+      pendingTokensRef.current = "";
+      streamingMsgIdRef.current = null;
+      tokenFlushEpochRef.current = null;
+    }
+
+    inflightRef.current = false;
+    streamingRef.current = false;
+
+    if (mode !== "unmount") {
+      setStreaming(false);
+      setInflight(false);
+    }
+  }, []);
+
+  const flushPendingTokens = useCallback(() => {
+    rafIdRef.current = null;
+    if (
+      tokenFlushEpochRef.current === null ||
+      tokenFlushEpochRef.current !== chatEpochRef.current
+    ) {
+      pendingTokensRef.current = "";
+      return;
+    }
+
+    const tokens = pendingTokensRef.current;
+    if (!tokens || streamingMsgIdRef.current === null) return;
+
+    pendingTokensRef.current = "";
+    const targetId = streamingMsgIdRef.current;
+    setMessages((prev) =>
+      prev.map((m) =>
+        m.id === targetId ? { ...m, text: m.text + tokens } : m
+      )
+    );
+  }, []);
+
+  const enqueueToken = useCallback(
+    (text: string, epoch: number) => {
+      pendingTokensRef.current += text;
+      tokenFlushEpochRef.current = epoch;
+      if (rafIdRef.current === null) {
+        rafIdRef.current = requestAnimationFrame(flushPendingTokens);
+      }
+    },
+    [flushPendingTokens]
+  );
 
   // When session changes, reset local chat state and hydrate history from backend.
   useEffect(() => {
@@ -120,16 +195,14 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
 
     const requestId = historyRequestRef.current + 1;
     historyRequestRef.current = requestId;
+    chatEpochRef.current += 1;
+    resetTurn("session");
 
     setInput("");
     setAttachment(null);
     setSessionNotice(null);
     setRemoveError(null);
-    setInflight(false);
-    setStreaming(false);
     readyAnnouncedForDocRef.current = null;
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = null;
 
     setHistoryLoading(true);
     setMessages([]);
@@ -141,7 +214,6 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
           getSession(sessionId),
         ]);
         if (historyRequestRef.current !== requestId) return;
-        if (inflightRef.current || streamingRef.current) return;
 
         setMessages(
           historyResult.messages.length > 0
@@ -155,7 +227,6 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
         const documentId = documentIds[documentIds.length - 1];
         const restored = await restoreSessionAttachment(documentId);
         if (historyRequestRef.current !== requestId) return;
-        if (inflightRef.current || streamingRef.current) return;
 
         if (restored.attachment) {
           setAttachment(restored.attachment);
@@ -166,7 +237,6 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
         }
       } catch {
         if (historyRequestRef.current !== requestId) return;
-        if (inflightRef.current || streamingRef.current) return;
         setMessages(welcomeMessages);
       } finally {
         if (historyRequestRef.current === requestId) {
@@ -174,7 +244,7 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
         }
       }
     })();
-  }, [sessionId]);
+  }, [sessionId, resetTurn]);
 
   const poll = useDocumentPolling(
     attachment?.documentId,
@@ -232,58 +302,40 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
     );
   }, [poll.status, attachment]);
 
-  // ------------------------------------------------------------------
-  // Token batching: flush accumulated tokens to the message via rAF
-  // ------------------------------------------------------------------
-  const flushPendingTokens = useCallback(() => {
-    rafIdRef.current = null;
-    const tokens = pendingTokensRef.current;
-    if (!tokens || streamingMsgIdRef.current === null) return;
-    pendingTokensRef.current = "";
-    const targetId = streamingMsgIdRef.current;
-    setMessages((prev) =>
-      prev.map((m) =>
-        m.id === targetId ? { ...m, text: m.text + tokens } : m
-      )
-    );
-  }, []);
-
-  const enqueueToken = useCallback(
-    (text: string) => {
-      pendingTokensRef.current += text;
-      if (rafIdRef.current === null) {
-        rafIdRef.current = requestAnimationFrame(flushPendingTokens);
-      }
-    },
-    [flushPendingTokens]
-  );
-
-  // Clean up rAF on unmount.
   useEffect(() => {
     return () => {
-      if (rafIdRef.current !== null) cancelAnimationFrame(rafIdRef.current);
+      resetTurn("unmount");
     };
-  }, []);
+  }, [resetTurn]);
 
-  // ------------------------------------------------------------------
-  // Stream consumption
-  // ------------------------------------------------------------------
   const consumeStream = useCallback(
     async (
       generator: AsyncGenerator<StreamEvent>,
       msgId: number,
+      epoch: number,
     ) => {
       streamingMsgIdRef.current = msgId;
       let receivedComplete = false;
 
       for await (const event of generator) {
+        if (chatEpochRef.current !== epoch) return;
+
         switch (event.type) {
           case "token":
-            enqueueToken(event.text);
+            enqueueToken(event.text, epoch);
             break;
 
-          case "complete":
-            // Flush any remaining buffered tokens before attaching metadata.
+          case "complete": {
+            const retrievalDebug = retrievalDebugFromCompleteRaw(event._raw);
+            const completeMetadata = {
+              sources: event.sources,
+              latency_ms: event.latency_ms,
+              model: event.model,
+              isStreaming: false,
+              ...(retrievalDebug !== undefined
+                ? { retrieval_debug: retrievalDebug }
+                : {}),
+            };
             if (pendingTokensRef.current) {
               if (rafIdRef.current !== null) {
                 cancelAnimationFrame(rafIdRef.current);
@@ -291,43 +343,27 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
               }
               const remaining = pendingTokensRef.current;
               pendingTokensRef.current = "";
+              tokenFlushEpochRef.current = null;
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === msgId
-                    ? {
-                        ...m,
-                        text: m.text + remaining,
-                        sources: event.sources,
-                        latency_ms: event.latency_ms,
-                        model: event.model,
-                        isStreaming: false,
-                      }
+                    ? { ...m, text: m.text + remaining, ...completeMetadata }
                     : m
                 )
               );
             } else {
               setMessages((prev) =>
                 prev.map((m) =>
-                  m.id === msgId
-                    ? {
-                        ...m,
-                        sources: event.sources,
-                        latency_ms: event.latency_ms,
-                        model: event.model,
-                        isStreaming: false,
-                      }
-                    : m
+                  m.id === msgId ? { ...m, ...completeMetadata } : m
                 )
               );
             }
             receivedComplete = true;
             break;
+          }
 
           case "done":
-            // Legacy completion marker. If we already got `complete`, this is
-            // a no-op. Otherwise mark the message as finished.
             if (!receivedComplete) {
-              // Flush remaining tokens
               if (pendingTokensRef.current) {
                 if (rafIdRef.current !== null) {
                   cancelAnimationFrame(rafIdRef.current);
@@ -335,6 +371,7 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
                 }
                 const remaining = pendingTokensRef.current;
                 pendingTokensRef.current = "";
+                tokenFlushEpochRef.current = null;
                 setMessages((prev) =>
                   prev.map((m) =>
                     m.id === msgId
@@ -353,7 +390,6 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
             break;
 
           case "error":
-            // Flush remaining tokens, then mark error.
             if (pendingTokensRef.current) {
               if (rafIdRef.current !== null) {
                 cancelAnimationFrame(rafIdRef.current);
@@ -361,6 +397,7 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
               }
               const remaining = pendingTokensRef.current;
               pendingTokensRef.current = "";
+              tokenFlushEpochRef.current = null;
               setMessages((prev) =>
                 prev.map((m) =>
                   m.id === msgId
@@ -395,42 +432,16 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
     [enqueueToken]
   );
 
-  // ------------------------------------------------------------------
-  // Stop streaming
-  // ------------------------------------------------------------------
   const stopStreaming = useCallback(() => {
-    abortControllerRef.current?.abort();
-    abortControllerRef.current = null;
+    resetTurn("stop");
+  }, [resetTurn]);
 
-    // Flush any remaining tokens and mark the message as done.
-    if (streamingMsgIdRef.current !== null) {
-      const msgId = streamingMsgIdRef.current;
-      if (rafIdRef.current !== null) {
-        cancelAnimationFrame(rafIdRef.current);
-        rafIdRef.current = null;
-      }
-      const remaining = pendingTokensRef.current;
-      pendingTokensRef.current = "";
-      setMessages((prev) =>
-        prev.map((m) =>
-          m.id === msgId
-            ? { ...m, text: m.text + remaining, isStreaming: false }
-            : m
-        )
-      );
-      streamingMsgIdRef.current = null;
-    }
-
-    setStreaming(false);
-    setInflight(false);
-  }, []);
-
-  // ------------------------------------------------------------------
-  // Send handler — tries streaming first, falls back to sync
-  // ------------------------------------------------------------------
   const handleSend = async () => {
     const text = input.trim();
-    if (!text || inflight) return;
+    if (!text || inflightRef.current) return;
+
+    inflightRef.current = true;
+    const epoch = chatEpochRef.current;
 
     setInput("");
 
@@ -445,6 +456,7 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
           text: "Please upload a document first so I can answer questions about it.",
         },
       ]);
+      inflightRef.current = false;
       return;
     }
 
@@ -459,6 +471,7 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
           text: "Your document is still processing. Please wait a moment and try again.",
         },
       ]);
+      inflightRef.current = false;
       return;
     }
 
@@ -473,6 +486,7 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
           text: "Document processing failed. Please remove it and upload again.",
         },
       ]);
+      inflightRef.current = false;
       return;
     }
 
@@ -484,7 +498,6 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
     setInflight(true);
 
     try {
-      // --- Attempt streaming first ---
       const controller = new AbortController();
       abortControllerRef.current = controller;
 
@@ -493,13 +506,14 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
         matchCount: retrievalSettings.matchCount,
         scope: retrievalSettings.scope,
         sessionId,
+        signal: controller.signal,
       };
 
-      // Add empty AI message with isStreaming flag.
       setMessages((prev) => [
         ...prev,
         { id: aiMsgId, sender: "ai", text: "", isStreaming: true },
       ]);
+      streamingRef.current = true;
       setStreaming(true);
 
       try {
@@ -509,16 +523,19 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
           chatOptions,
           controller.signal,
         );
-        await consumeStream(generator, aiMsgId);
+        await consumeStream(generator, aiMsgId, epoch);
       } catch (e) {
+        if (chatEpochRef.current !== epoch) return;
+
         if (e instanceof StreamingDisabledError) {
-          // --- Fallback to sync path ---
+          streamingRef.current = false;
           setStreaming(false);
 
-          // Remove the empty streaming message, we'll add a proper one.
           setMessages((prev) => prev.filter((m) => m.id !== aiMsgId));
 
           const response = await sendMessage(text, attachment.documentId, chatOptions);
+          if (chatEpochRef.current !== epoch) return;
+
           setMessages((prev) => [
             ...prev,
             {
@@ -536,8 +553,8 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
                 : {}),
             },
           ]);
-        } else if (e instanceof DOMException && e.name === "AbortError") {
-          // Stream was cancelled by the user — already handled by stopStreaming.
+        } else if (isAbortError(e)) {
+          // Stop/session/unmount already handled cleanup.
         } else {
           throw e;
         }
@@ -545,6 +562,9 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
 
       abortControllerRef.current = null;
     } catch (e) {
+      if (chatEpochRef.current !== epoch) return;
+      if (isAbortError(e)) return;
+
       let errorText = "Something went wrong. Please try again.";
       if (e instanceof ChatError) {
         errorText = e.message;
@@ -552,7 +572,6 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
           setAttachment((curr) => (curr ? { ...curr, status: "failed" } : curr));
         }
       }
-      // If we already have an AI message from streaming, update it with error.
       setMessages((prev) => {
         const existing = prev.find((m) => m.id === base + 1);
         if (existing) {
@@ -565,8 +584,12 @@ export function useChat(sessionId: string | null, retrievalSettings: RetrievalSe
         return [...prev, { id: base + 1, sender: "ai" as const, text: errorText }];
       });
     } finally {
-      setInflight(false);
-      setStreaming(false);
+      if (chatEpochRef.current === epoch) {
+        inflightRef.current = false;
+        streamingRef.current = false;
+        setInflight(false);
+        setStreaming(false);
+      }
     }
   };
 

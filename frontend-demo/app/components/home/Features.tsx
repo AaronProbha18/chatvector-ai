@@ -6,7 +6,7 @@ const FEATURES = [
     color: "var(--accent-text)",
     bg: "color-mix(in srgb, var(--accent) 10%, transparent)",
     title: "Multi-format ingestion",
-    desc: "PDF, Markdown, HTML, DOCX, plain text. Drop a folder and go.",
+    desc: "PDF and plain text uploads with async ingestion and live progress.",
     tag: "ingestion",
   },
   {
