@@ -109,6 +109,33 @@ Providers map SDK-specific errors to common exceptions so services stay provider
 
 Switching embedding providers requires a fresh database (`docker compose down -v`) because different models produce different vector dimensions and incompatible vector spaces.
 
+### Embedding Cache
+
+An optional Redis-backed cache sits in front of the embedding provider call
+in `services/embedding_service.get_embeddings()`, off by default
+(`ENABLE_EMBEDDING_CACHE=false`). When disabled, behavior is byte-identical
+to having no cache — no Redis calls occur.
+
+When enabled:
+
+- Cache key hashes `(EMBEDDING_PROVIDER, provider.model_name, text)` —
+  changing the provider or model can never return a vector produced by a
+  different model, since the key changes with it.
+- Values are stored as JSON-encoded float lists; a cache hit returns the
+  exact bytes stored on a prior miss.
+- Any Redis error (down, unreachable, timeout) is caught and logged as a
+  warning; the request falls through to the real provider call — the cache
+  never fails a request.
+- `EMBEDDING_CACHE_INCLUDE_TENANT` optionally folds `tenant_id` into the key
+  for deployments where embedding text could be cross-tenant sensitive
+  under a shared Redis instance. This only changes the cache key — it is
+  not a second ACL system.
+- `probe_embedding_health` (the `/status` sub-check) always bypasses the
+  cache and calls the real provider directly.
+- Eval/benchmark tooling must not set `ENABLE_EMBEDDING_CACHE=true` in its
+  own process environment unless it specifically wants cached vectors —
+  documented coordination point; no such runner exists in this repo yet.
+
 ---
 
 ## Development vs Production
