@@ -106,13 +106,15 @@ async def generate_answer_stream(question: str, context: str) -> AsyncGenerator[
         yield chunk
 
 
-async def get_embeddings(texts: list[str]) -> list[list[float]]:
+async def get_embeddings(
+    texts: list[str], *, tenant_id: str | None = None
+) -> list[list[float]]:
     """
     Lazily import batch embedding dependency to keep module import side-effect free.
     """
     from services.embedding_service import get_embeddings as _get_embeddings
 
-    return await _get_embeddings(texts)
+    return await _get_embeddings(texts, tenant_id=tenant_id)
 
 
 def _normalize_doc_ids(doc_ids: list[str], *, query_index: int) -> list[str]:
@@ -467,7 +469,7 @@ async def answer_question_for_document(
     retrieval_debug = _maybe_retrieval_debug(
         transform_result, debug_retrieval=debug_retrieval
     )
-    query_embeddings = await get_embeddings(transformed_queries)
+    query_embeddings = await get_embeddings(transformed_queries, tenant_id=tenant_id)
     all_chunks: list = []
     seen_chunk_keys: set = set()
     for query_embedding in query_embeddings:
@@ -593,7 +595,7 @@ async def answer_question_stream_for_document(
         retrieval_debug = _maybe_retrieval_debug(
             transform_result, debug_retrieval=debug_retrieval
         )
-        query_embeddings = await get_embeddings(transformed_queries)
+        query_embeddings = await get_embeddings(transformed_queries, tenant_id=tenant_id)
         all_chunks: list = []
         seen_chunk_keys: set = set()
         for query_embedding in query_embeddings:
@@ -769,7 +771,7 @@ async def answer_questions_for_documents_batch(
     transformed_query_lists = [result.queries for result in transform_results]
     flat_queries = [q for queries in transformed_query_lists for q in queries]
     try:
-        flat_embeddings = await get_embeddings(flat_queries)
+        flat_embeddings = await get_embeddings(flat_queries, tenant_id=tenant_id)
     except Exception as e:
         logger.error("Batch embedding call failed: %s", e, exc_info=True)
         embedding_message = "Failed to generate embeddings for batch request."

@@ -18,15 +18,7 @@ logger = logging.getLogger(__name__)
 EMBEDDING_DIM = get_embedding_dim()
 
 
-async def get_embeddings(texts: list[str]) -> list[list[float]]:
-    """
-    Generate embeddings for multiple texts.
-
-    Delegates to whichever provider is selected via EMBEDDING_PROVIDER.
-    Retry logic is applied at this service layer — providers raise on failure.
-    """
-    provider = get_embedding_provider()
-
+async def _embed_via_provider(provider, texts: list[str]) -> list[list[float]]:
     async def _embed() -> list[list[float]]:
         logger.info("Requesting embeddings for %d inputs", len(texts))
         return await provider.embed(texts)
@@ -41,9 +33,57 @@ async def get_embeddings(texts: list[str]) -> list[list[float]]:
     )
 
 
-async def get_embedding(text: str) -> list[float]:
+async def get_embeddings(
+    texts: list[str], *, tenant_id: str | None = None
+) -> list[list[float]]:
+    """
+    Generate embeddings for multiple texts.
+
+    Delegates to whichever provider is selected via EMBEDDING_PROVIDER.
+    Retry logic is applied at this service layer — providers raise on failure.
+
+    When ``config.ENABLE_EMBEDDING_CACHE`` is false (default), this is
+    byte-identical to calling the provider directly — no cache import or
+    calls occur.
+    """
+    provider = get_embedding_provider()
+
+    if not config.ENABLE_EMBEDDING_CACHE:
+        return await _embed_via_provider(provider, texts)
+
+    from services.embedding_cache import get_cached_embedding, set_cached_embedding
+
+    model = provider.model_name
+    results: list[list[float] | None] = [None] * len(texts)
+    misses: list[tuple[int, str]] = []
+
+    for i, text in enumerate(texts):
+        cached = await get_cached_embedding(
+            text, provider=config.EMBEDDING_PROVIDER, model=model, tenant_id=tenant_id
+        )
+        if cached is not None:
+            results[i] = cached
+        else:
+            misses.append((i, text))
+
+    if misses:
+        miss_vectors = await _embed_via_provider(provider, [text for _, text in misses])
+        for (i, text), vector in zip(misses, miss_vectors):
+            results[i] = vector
+            await set_cached_embedding(
+                text,
+                vector,
+                provider=config.EMBEDDING_PROVIDER,
+                model=model,
+                tenant_id=tenant_id,
+            )
+
+    return results  # type: ignore[return-value]
+
+
+async def get_embedding(text: str, *, tenant_id: str | None = None) -> list[float]:
     """Convenience wrapper for single-text embedding."""
-    return (await get_embeddings([text]))[0]
+    return (await get_embeddings([text], tenant_id=tenant_id))[0]
 
 
 async def probe_embedding_health(text: str) -> None:
