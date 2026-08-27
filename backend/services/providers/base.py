@@ -84,6 +84,12 @@ _DEFAULT_EMBEDDING_MODELS: dict[str, str] = {
 class EmbeddingProvider(ABC):
     """Common interface for text-embedding implementations."""
 
+    @property
+    def model_name(self) -> str:
+        """Return the model identifier used by this provider instance."""
+        model: str | None = getattr(self, "_model", None)
+        return model or ""
+
     @abstractmethod
     async def embed(self, texts: list[str]) -> list[list[float]]:
         """Return one embedding vector per input text."""

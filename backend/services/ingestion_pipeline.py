@@ -831,7 +831,7 @@ class IngestionPipeline:
             batch_texts = texts[start : start + _EMBEDDING_PROGRESS_BATCH_SIZE]
             if rate_limiter is not None:
                 await rate_limiter.acquire()
-            batch_embeddings = await get_embeddings(batch_texts)
+            batch_embeddings = await get_embeddings(batch_texts, tenant_id=tenant_id)
             embeddings.extend(batch_embeddings)
             processed = start + len(batch_texts)
             await self._update_status(

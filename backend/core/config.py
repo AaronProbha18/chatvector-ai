@@ -234,6 +234,21 @@ class Settings:
         1, int(os.getenv("LLM_HEALTH_CHECK_TIMEOUT_SEC", "10"))
     )
 
+    # Optional Redis-backed embedding cache (default off).
+    ENABLE_EMBEDDING_CACHE: bool = os.getenv(
+        "ENABLE_EMBEDDING_CACHE", "false"
+    ).lower() in ("1", "true", "yes")
+    EMBEDDING_CACHE_KEY_PREFIX: str = os.getenv(
+        "EMBEDDING_CACHE_KEY_PREFIX", "chatvector:embedcache"
+    )
+    # 0 means no expiry (persist until evicted/overwritten).
+    EMBEDDING_CACHE_TTL_SECONDS: int = max(
+        0, int(os.getenv("EMBEDDING_CACHE_TTL_SECONDS", "0"))
+    )
+    EMBEDDING_CACHE_INCLUDE_TENANT: bool = os.getenv(
+        "EMBEDDING_CACHE_INCLUDE_TENANT", "false"
+    ).lower() in ("1", "true", "yes")
+
 VALID_QUEUE_BACKENDS = {"memory", "redis"}
 
 
